@@ -51,6 +51,7 @@ static Result ensure_workbuf(void) {
 }
 
 void input_suspend(void) {
+    hiddbgUnsetTouchScreenAutoPilotState();
     if (g_attached) {
         hiddbgDetachHdlsVirtualDevice(g_handle);
         g_attached = false;
@@ -179,6 +180,7 @@ Result input_release(u64 mask) {
 }
 
 Result input_clear(void) {
+    hiddbgUnsetTouchScreenAutoPilotState();
     if (!g_attached)
         return 0;
     g_state.buttons = 0;
@@ -215,4 +217,59 @@ Result input_stick(int side, float x, float y, int duration_ms) {
         rc = apply_state();
     }
     return rc;
+}
+
+static u32 clamp_coord(int v, int max_val) {
+    if (v < 0) return 0;
+    if (v >= max_val) return (u32)(max_val - 1);
+    return (u32)v;
+}
+
+Result input_touch(int x, int y, int x2, int y2, int duration_ms) {
+    u32 sx = clamp_coord(x, 1280);
+    u32 sy = clamp_coord(y, 720);
+    bool is_swipe = (x2 >= 0 && y2 >= 0 && (x2 != x || y2 != y));
+    u32 ex = is_swipe ? clamp_coord(x2, 1280) : sx;
+    u32 ey = is_swipe ? clamp_coord(y2, 720) : sy;
+    duration_ms = clamp_duration(duration_ms);
+
+    int steps = 1;
+    if (is_swipe) {
+        steps = duration_ms / 16;
+        if (steps < 2) steps = 2;
+        if (steps > 120) steps = 120;
+    }
+    s64 step_ns = ((s64)duration_ms * 1000000LL) / steps;
+
+    HidTouchState st = {0};
+    st.finger_id = 0;
+    st.diameter_x = 30;
+    st.diameter_y = 30;
+
+    for (int i = 0; i < steps; i++) {
+        st.delta_time = (i == 0) ? (u64)step_ns : 0;
+        st.x = (u32)((s32)sx + ((s32)ex - (s32)sx) * i / steps);
+        st.y = (u32)((s32)sy + ((s32)ey - (s32)sy) * i / steps);
+        st.attributes = 0;
+        Result rc = hiddbgSetTouchScreenAutoPilotState(&st, 1);
+        if (R_FAILED(rc)) {
+            LOGF("input: touch step %d failed rc=0x%x\n", i, rc);
+            hiddbgUnsetTouchScreenAutoPilotState();
+            return rc;
+        }
+        svcSleepThread(step_ns);
+    }
+
+    if (is_swipe) {
+        st.delta_time = 0;
+        st.x = ex;
+        st.y = ey;
+        st.attributes = 0;
+        hiddbgSetTouchScreenAutoPilotState(&st, 1);
+        svcSleepThread(step_ns);
+    }
+
+    hiddbgSetTouchScreenAutoPilotState(NULL, 0);
+    svcSleepThread(20000000ULL);
+    return hiddbgUnsetTouchScreenAutoPilotState();
 }

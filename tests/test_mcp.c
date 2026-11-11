@@ -11,6 +11,7 @@
 #include "base64.h"
 #include "buttons.h"
 #include "config.h"
+#include "files.h"
 #include "http.h"
 #include "mcp.h"
 #include "oauth.h"
@@ -20,6 +21,7 @@
 extern uint64_t stub_tap_mask;
 extern int stub_tap_duration;
 extern int stub_tap_count;
+extern int stub_touch_x, stub_touch_y, stub_touch_x2, stub_touch_y2, stub_touch_duration;
 
 // Issues one POST /mcp request with the given JSON body; returns the raw HTTP
 // response in a static buffer.
@@ -519,6 +521,100 @@ static void test_telemetry_tools(void) {
     printf("telemetry tools ok\n");
 }
 
+static void test_touch_screen(void) {
+    const char *r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\","
+                           "\"params\":{\"name\":\"touch_screen\",\"arguments\":"
+                           "{\"x\":640,\"y\":360,\"durationMs\":150}}}");
+    assert(strstr(r, "\"isError\":false"));
+    assert(stub_touch_x == 640 && stub_touch_y == 360);
+    assert(stub_touch_x2 == -1 && stub_touch_y2 == -1);
+    assert(stub_touch_duration == 150);
+
+    // Swipe test
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"touch_screen\",\"arguments\":"
+               "{\"x\":100,\"y\":200,\"x2\":900,\"y2\":200,\"durationMs\":300}}}");
+    assert(strstr(r, "\"isError\":false"));
+    assert(stub_touch_x == 100 && stub_touch_y == 200);
+    assert(stub_touch_x2 == 900 && stub_touch_y2 == 200);
+    assert(stub_touch_duration == 300);
+
+    // Invalid bounds -> tool error
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"touch_screen\",\"arguments\":{\"x\":1280,\"y\":100}}}");
+    assert(strstr(r, "\"isError\":true"));
+
+    // Partial swipe coord -> tool error
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"touch_screen\",\"arguments\":{\"x\":100,\"y\":100,\"x2\":200}}}");
+    assert(strstr(r, "\"isError\":true"));
+    printf("touch_screen ok\n");
+}
+
+static void test_files_put_atomic(void) {
+    // Prepare existing file on fake SD
+    char target[512];
+    snprintf(target, sizeof(target), "%s/atomic.bin", FAKE_SD);
+    FILE *f = fopen(target, "wb");
+    assert(f);
+    fputs("ORIGINAL_DATA", f);
+    fclose(f);
+
+    // 1. Aborted PUT (Content-Length 100, only 5 bytes sent)
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char *aborted = "PUT /files?path=/atomic.bin HTTP/1.1\r\nContent-Length: 100\r\n\r\nPART_";
+    assert(write(sv[1], aborted, strlen(aborted)) == (ssize_t)strlen(aborted));
+    shutdown(sv[1], SHUT_WR);
+
+    static HttpRequest hreq;
+    assert(http_read_request(sv[0], &hreq));
+    files_handle_put(&hreq);
+    close(sv[0]);
+
+    char resp[512];
+    ssize_t rn = read(sv[1], resp, sizeof(resp) - 1);
+    resp[rn > 0 ? rn : 0] = '\0';
+    close(sv[1]);
+    assert(strstr(resp, "400 Bad Request"));
+
+    // Verify original file is intact and .tmp is cleaned up
+    char buf[64] = {0};
+    f = fopen(target, "rb");
+    assert(f);
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    assert(strcmp(buf, "ORIGINAL_DATA") == 0);
+
+    char tmp[520];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", target);
+    struct stat st;
+    assert(stat(tmp, &st) != 0);
+
+    // 2. Complete PUT replaces file cleanly
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    const char *complete = "PUT /files?path=/atomic.bin HTTP/1.1\r\nContent-Length: 8\r\n\r\nNEW_DATA";
+    assert(write(sv[1], complete, strlen(complete)) == (ssize_t)strlen(complete));
+    shutdown(sv[1], SHUT_WR);
+
+    assert(http_read_request(sv[0], &hreq));
+    files_handle_put(&hreq);
+    close(sv[0]);
+    rn = read(sv[1], resp, sizeof(resp) - 1);
+    resp[rn > 0 ? rn : 0] = '\0';
+    close(sv[1]);
+    assert(strstr(resp, "201 Created"));
+
+    memset(buf, 0, sizeof(buf));
+    f = fopen(target, "rb");
+    assert(f);
+    fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    assert(strcmp(buf, "NEW_DATA") == 0);
+    assert(stat(tmp, &st) != 0);
+    printf("files put atomic ok\n");
+}
+
 static Config g_cfg_for_oauth;
 
 int main(void) {
@@ -541,6 +637,8 @@ int main(void) {
     test_process_tools();
     test_diagnostics_tools();
     test_telemetry_tools();
+    test_touch_screen();
+    test_files_put_atomic();
     printf("all mcp tests passed\n");
     return 0;
 }

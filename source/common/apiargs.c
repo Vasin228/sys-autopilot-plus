@@ -73,3 +73,47 @@ bool args_get_stick(const JsonDoc *doc, int obj, int *out_side, float *out_x,
     *out_duration = args_get_duration(doc, obj, 0);
     return true;
 }
+
+static bool get_coord(const JsonDoc *doc, int obj, const char *key, int max_val,
+                      bool required, bool *present, int *out, const char **err) {
+    int tok = json_obj_get(doc, obj, key);
+    if (tok < 0) {
+        if (present) *present = false;
+        if (required) {
+            *err = "missing 'x' or 'y' touchscreen coordinates";
+            return false;
+        }
+        return true;
+    }
+    long long v = 0;
+    if (!json_get_int(doc, tok, &v) || v < 0 || v >= max_val) {
+        *err = "touchscreen coordinates must be integers in 0..1279 (x) and 0..719 (y)";
+        return false;
+    }
+    if (present) *present = true;
+    *out = (int)v;
+    return true;
+}
+
+bool args_get_touch(const JsonDoc *doc, int obj, int *out_x, int *out_y,
+                    int *out_x2, int *out_y2, int *out_duration,
+                    int default_duration, const char **err) {
+    if (!get_coord(doc, obj, "x", 1280, true, NULL, out_x, err) ||
+        !get_coord(doc, obj, "y", 720, true, NULL, out_y, err))
+        return false;
+
+    bool has_x2 = false, has_y2 = false;
+    int x2 = -1, y2 = -1;
+    if (!get_coord(doc, obj, "x2", 1280, false, &has_x2, &x2, err) ||
+        !get_coord(doc, obj, "y2", 720, false, &has_y2, &y2, err))
+        return false;
+
+    if (has_x2 != has_y2) {
+        *err = "both 'x2' and 'y2' are required for a swipe";
+        return false;
+    }
+    *out_x2 = has_x2 ? x2 : -1;
+    *out_y2 = has_y2 ? y2 : -1;
+    *out_duration = args_get_duration(doc, obj, default_duration);
+    return true;
+}

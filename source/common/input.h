@@ -30,3 +30,7 @@ Result input_clear(void);
 // side: 0 = left stick, 1 = right stick. x/y in [-1.0, 1.0].
 // If duration_ms > 0, the stick returns to neutral afterwards.
 Result input_stick(int side, float x, float y, int duration_ms);
+
+// Tap or swipe the touchscreen (1280x720 logical coordinates).
+// Pass x2 < 0 or y2 < 0 for a single-point tap at (x, y).
+Result input_touch(int x, int y, int x2, int y2, int duration_ms);

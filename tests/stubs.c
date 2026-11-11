@@ -14,6 +14,7 @@ int stub_tap_count;
 u64 stub_hold_mask;
 int stub_stick_side;
 float stub_stick_x, stub_stick_y;
+int stub_touch_x, stub_touch_y, stub_touch_x2, stub_touch_y2, stub_touch_duration;
 bool stub_cleared;
 
 void input_suspend(void) {}
@@ -21,6 +22,7 @@ void input_exit(void) {}
 Result input_attach(void) { return 0; }
 Result input_detach(void) { return 0; }
 bool input_is_attached(void) { return true; }
+Result input_handshake(void) { return 0; }
 
 Result input_tap(u64 mask, int duration_ms) {
     stub_tap_mask = mask;
@@ -38,6 +40,15 @@ Result input_stick(int side, float x, float y, int duration_ms) {
     stub_stick_side = side;
     stub_stick_x = x;
     stub_stick_y = y;
+    return 0;
+}
+
+Result input_touch(int x, int y, int x2, int y2, int duration_ms) {
+    stub_touch_x = x;
+    stub_touch_y = y;
+    stub_touch_x2 = x2;
+    stub_touch_y2 = y2;
+    stub_touch_duration = duration_ms;
     return 0;
 }
 

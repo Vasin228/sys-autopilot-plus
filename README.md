@@ -113,7 +113,7 @@ zeroconf mechanism used by printers and Chromecasts). Two things are exposed:
 
   | TXT key | Example | Meaning |
   |---|---|---|
-  | `version` | `1.5.1` | sys-autopilot version |
+  | `version` | `1.5.2` | sys-autopilot version |
   | `path` | `/mcp` | MCP endpoint path |
   | `auth` | `oauth` / `token` / `none` | Configured auth scheme |
   | `model` | `oled` | Console model (`v1`/`v2`/`lite`/`oled`) |
@@ -200,6 +200,7 @@ Details:
 | `tap_sequence` | Up to 32 taps in one call (menu navigation without round-trips) |
 | `hold_buttons` / `release_buttons` | Persistent button state |
 | `set_stick` | Analog stick (`side`, `x`/`y` in -1..1, optional `durationMs`) |
+| `touch_screen` | Tap or swipe touchscreen in 1280x720 (`x`, `y`, optional `x2`/`y2`, `durationMs`) |
 | `clear_input` | Release everything, recenter sticks |
 | `status` | Server version, firmware, controller state, uptime, battery % / charging |
 | `list_directory` | JSON listing of an SD card directory |
@@ -269,6 +270,7 @@ POST /input/tap      {"buttons":["A","B"],"durationMs":200}
 POST /input/hold     {"buttons":["ZL"]}
 POST /input/release  {"buttons":["ZL"]}
 POST /input/stick    {"side":"left","x":1.0,"y":0.0,"durationMs":500}
+POST /input/touch    {"x":640,"y":360,"durationMs":200}  (add x2/y2 for swipe)
 POST /input/clear    (empty body)
 POST /controller/attach | /controller/detach
 POST /controller/handshake (or /controller/pair - pulses L+R for 300ms to pair Player 1 in games)
@@ -292,7 +294,7 @@ GET    /files?path=/switch/myapp/log.txt          download / read a file
 GET    /files?path=/switch/myapp/log.txt&offset=-4096   tail: last 4 KB
 GET    /files/hash?path=/switch/myapp.nro          SHA-256 digest (JSON)
 GET    /files?path=/switch/                       directory listing (JSON)
-PUT    /files?path=/switch/myapp.nro              upload (raw request body)
+PUT    /files?path=/switch/myapp.nro              upload (raw body, atomic via .tmp)
 DELETE /files?path=/switch/myapp.nro              delete file / empty dir
 ```
 

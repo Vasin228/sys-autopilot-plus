@@ -357,11 +357,18 @@ void files_handle_put(HttpRequest *req) {
         return;
     }
 
+    char tmppath[784];
+    if ((size_t)snprintf(tmppath, sizeof(tmppath), "%s.tmp", fspath) >= sizeof(tmppath)) {
+        http_send_error(req->fd, 400, "path too long");
+        return;
+    }
+
     files_mkdirs_for(fspath);
 
-    FILE *f = fopen(fspath, "wb");
+    // Stage into a temp file first so an aborted or failed upload never clobbers an existing file.
+    FILE *f = fopen(tmppath, "wb");
     if (!f) {
-        http_send_error(req->fd, 500, "failed to open file for writing");
+        http_send_error(req->fd, 500, "failed to open temp file for writing");
         return;
     }
 
@@ -380,14 +387,24 @@ void files_handle_put(HttpRequest *req) {
     fclose(f);
 
     if (write_err) {
-        remove(fspath);
+        remove(tmppath);
         http_send_error(req->fd, 507, "write failed (sd card full?)");
         return;
     }
     if (total != req->content_length) {
-        remove(fspath);
+        remove(tmppath);
         http_send_error(req->fd, 400, "incomplete upload");
         return;
+    }
+
+    // Try direct rename first; fall back to remove+rename on FatFS/newlib targets that fail EEXIST.
+    if (rename(tmppath, fspath) != 0) {
+        remove(fspath);
+        if (rename(tmppath, fspath) != 0) {
+            remove(tmppath);
+            http_send_error(req->fd, 500, "failed to move uploaded file into place");
+            return;
+        }
     }
 
     LOGF("files: wrote %zu bytes to %s\n", total, fspath);

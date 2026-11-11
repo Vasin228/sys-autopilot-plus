@@ -210,6 +210,21 @@ static void handle_input_stick(HttpRequest *req) {
     send_input_result(req, input_stick(side, x, y, duration));
 }
 
+static void handle_input_touch(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0)
+        return;
+    int x, y, x2, y2, duration;
+    const char *err = NULL;
+    if (!args_get_touch(&doc, root, &x, &y, &x2, &y2, &duration,
+                        INPUT_DEFAULT_TAP_MS, &err)) {
+        http_send_error(req->fd, 400, err);
+        return;
+    }
+    send_input_result(req, input_touch(x, y, x2, y2, duration));
+}
+
 // --- /status -----------------------------------------------------------------
 
 static void handle_status(HttpRequest *req) {
@@ -788,6 +803,7 @@ static const Route kRoutes[] = {
     { "POST",   "/input/hold",        handle_input_hold },
     { "POST",   "/input/release",     handle_input_release },
     { "POST",   "/input/stick",       handle_input_stick },
+    { "POST",   "/input/touch",       handle_input_touch },
     { "POST",   "/input/clear",       handle_input_clear },
     { "POST",   "/controller/attach", handle_controller_attach },
     { "POST",   "/controller/detach", handle_controller_detach },

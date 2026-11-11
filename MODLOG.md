@@ -265,3 +265,15 @@ Key root causes identified:
 - Packaged `sys-autopilot-plus-v1.5.1.zip` (417,478 bytes).
 - Amended clean commit on `main` authored by `Vasin228`, pushed to `origin/main` and tag `v1.5.1-plus`.
 - Published official GitHub Release `v1.5.1-plus` via GitHub API with release notes and `sys-autopilot-plus-v1.5.1.zip` asset.
+
+### 13. Touchscreen Emulation & Atomic File Uploads (v1.5.2-plus)
+- **Touchscreen Input (`POST /input/touch`, MCP `touch_screen`)**:
+  - Added `input_touch(x, y, x2, y2, duration_ms)` in `input.c` using `hiddbgSetTouchScreenAutoPilotState` and `hiddbgUnsetTouchScreenAutoPilotState`.
+  - Supports both single-point taps (`x`, `y` in 1280x720) and smooth interpolated swipes (`x2`, `y2`).
+  - Added `args_get_touch()` in `apiargs.c`, REST endpoint `POST /input/touch` in `routes.c`, and MCP tool `touch_screen` in `mcp.c` / `gen_tools.py`.
+- **Atomic File Uploads (`PUT /files`)**:
+  - Updated `files_handle_put()` in `files.c` to write incoming data into `<path>.tmp` first and only replace the target file via `rename()` once all bytes are written cleanly. On network drop or write failure, the temp file is deleted and the original file stays intact.
+- **Verification**:
+  - Host tests (`./tests/run.sh`) passed including new `touch_screen` and `files put atomic` cases.
+  - Built `exefs.nsp` (264,702 bytes, SHA256: `457bd0ae4ff103bdb99dd85fce785054ccc25dae90c0b72f8a7ddb2fe412ec4a`) and deployed via OTA.
+  - Verified live on Switch: `POST /input/touch` (both tap and swipe gestures) successfully navigated and scrolled the Home Menu.

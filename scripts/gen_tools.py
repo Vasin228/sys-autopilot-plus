@@ -88,6 +88,20 @@ tools = [
         }, "required": ["side"]},
     },
     {
+        "name": "touch_screen",
+        "description": ("Tap or swipe the Switch touchscreen in 1280x720 coordinates. "
+                        "Provide x (0..1279) and y (0..719) for a tap; optionally add x2, y2 "
+                        "to perform a smooth swipe between (x,y) and (x2,y2)."),
+        "inputSchema": {"type": "object", "properties": {
+            "x": {"type": "integer", "description": "Start X coordinate (0..1279)."},
+            "y": {"type": "integer", "description": "Start Y coordinate (0..719)."},
+            "x2": {"type": "integer", "description": "Optional end X coordinate for swipe (0..1279)."},
+            "y2": {"type": "integer", "description": "Optional end Y coordinate for swipe (0..719)."},
+            "durationMs": {"type": "integer", "description": "Touch/swipe duration in ms. Default 200, max 10000."},
+            **screenshot_props(),
+        }, "required": ["x", "y"]},
+    },
+    {
         "name": "clear_input",
         "description": "Release all held buttons and recenter both sticks.",
         "inputSchema": {"type": "object", "properties": {**screenshot_props()}},
