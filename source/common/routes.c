@@ -12,6 +12,10 @@
 #include "screen.h"
 #include "settings.h"
 #include "log.h"
+#include "process.h"
+#include "diagnostics.h"
+#include "telemetry.h"
+#include "server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +93,65 @@ static void handle_screenshot(HttpRequest *req) {
         return;
     }
     http_send_response(req->fd, 200, "image/jpeg", jpeg, (size_t)size);
+}
+
+static void handle_stream(HttpRequest *req) {
+    ViLayerStack stack = ViLayerStack_Screenshot;
+    char val[32];
+    if (http_query_get(req, "stack", val, sizeof(val))) {
+        if (!screen_parse_stack(val, &stack)) {
+            http_send_error(req->fd, 400, "invalid 'stack'");
+            return;
+        }
+    }
+    int fps = 10;
+    if (http_query_get(req, "fps", val, sizeof(val))) {
+        fps = atoi(val);
+        if (fps < 1) fps = 1;
+        if (fps > 30) fps = 30;
+    }
+
+    static const char stream_hdr[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: sys-autopilot\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Pragma: no-cache\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "\r\n";
+    if (!http_write_all(req->fd, stream_hdr, sizeof(stream_hdr) - 1))
+        return;
+
+    const u8 *jpeg = NULL;
+    u64 size = 0;
+    Result rc = screen_capture_jpeg(stack, &jpeg, &size);
+    if (R_SUCCEEDED(rc) && size > 0) {
+        char part_hdr[128];
+        int plen = snprintf(part_hdr, sizeof(part_hdr),
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %llu\r\n\r\n",
+            (unsigned long long)size);
+        http_write_all(req->fd, part_hdr, plen);
+        http_write_all(req->fd, jpeg, (size_t)size);
+        http_write_all(req->fd, "\r\n", 2);
+    }
+
+    server_start_stream(req->fd, fps, stack);
+    req->fd = -1;
+}
+
+static void handle_telemetry(HttpRequest *req) {
+    TelemetryStats stats;
+    if (!telemetry_collect(&stats)) {
+        http_send_error(req->fd, 500, "failed to collect telemetry");
+        return;
+    }
+    char json_buf[1024];
+    int len = telemetry_format_json(&stats, json_buf, sizeof(json_buf));
+    if (len < 0) {
+        http_send_error(req->fd, 500, "failed to format telemetry");
+        return;
+    }
+    http_send_response(req->fd, 200, "application/json", json_buf, (size_t)len);
 }
 
 // --- /input/* ----------------------------------------------------------------
@@ -380,29 +443,93 @@ static const char *storage_label(uint8_t storage_id) {
     }
 }
 
+// Heap-grown JSON body for /titles (the list has no fixed upper bound).
+typedef struct {
+    char  *buf;
+    size_t len, cap;
+    int    count;
+} TitlesJson;
+
+static bool titles_json_append(TitlesJson *j, const char *s, size_t n) {
+    if (j->len + n + 1 > j->cap) {
+        size_t newcap = j->cap ? j->cap : 4096;
+        while (j->len + n + 1 > newcap)
+            newcap *= 2;
+        char *nb = realloc(j->buf, newcap);
+        if (!nb)
+            return false;
+        j->buf = nb;
+        j->cap = newcap;
+    }
+    memcpy(j->buf + j->len, s, n);
+    j->len += n;
+    j->buf[j->len] = '\0';
+    return true;
+}
+
+static bool titles_json_visit(const TitleInfo *t, void *ctx) {
+    TitlesJson *j = ctx;
+    char name[sizeof(t->name) * 6 + 1]; // worst case: every byte -> \u00XX
+    json_escape(t->name, strlen(t->name), name, sizeof(name));
+    char entry[sizeof(name) + 128];
+    int n = snprintf(entry, sizeof(entry),
+        "%s{\"titleId\":\"%016llx\",\"version\":%u,\"storage\":\"%s\",\"name\":\"%s\"}",
+        j->count ? "," : "", (unsigned long long)t->title_id,
+        t->version, storage_label(t->storage_id), name);
+    if (n < 0 || (size_t)n >= sizeof(entry))
+        return false;
+    j->count++;
+    return titles_json_append(j, entry, (size_t)n);
+}
+
+// Parses an optional non-negative integer query parameter. Returns false (and
+// sends a 400) when it's present but malformed.
+static bool query_nonneg_int(HttpRequest *req, const char *key, int *out) {
+    char val[16];
+    if (!http_query_get(req, key, val, sizeof(val)) || !val[0])
+        return true;
+    char *end;
+    long v = strtol(val, &end, 10);
+    if (*end || v < 0 || v > 0x7fffffffL) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "'%s' must be a non-negative integer", key);
+        http_send_error(req->fd, 400, msg);
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
+// GET /titles[?offset=N][&limit=M]. Returns every installed title by default;
+// offset/limit select a window. "total" is always the full installed count.
 static void handle_titles(HttpRequest *req) {
-    static TitleInfo titles[TITLES_MAX];
-    int count = 0;
+    int offset = 0, limit = -1;
+    if (!query_nonneg_int(req, "offset", &offset) ||
+        !query_nonneg_int(req, "limit", &limit))
+        return;
+
+    TitlesJson j = {0};
     char err[128] = {0};
-    if (!titles_list(titles, TITLES_MAX, &count, err, sizeof(err))) {
-        http_send_error(req->fd, 500, err[0] ? err : "failed to list titles");
+    int total = 0;
+    if (!titles_json_append(&j, "{\"titles\":[", 11)) {
+        http_send_error(req->fd, 500, "out of memory");
         return;
     }
-
-    // Build the JSON into a static buffer (the list can be large). Each entry is
-    // well under 256 bytes; TITLES_MAX entries fit comfortably.
-    static char body[TITLES_MAX * 256 + 32];
-    size_t pos = (size_t)snprintf(body, sizeof(body), "{\"titles\":[");
-    for (int i = 0; i < count && pos < sizeof(body) - 256; i++) {
-        char name[160];
-        json_escape(titles[i].name, strlen(titles[i].name), name, sizeof(name));
-        pos += (size_t)snprintf(body + pos, sizeof(body) - pos,
-            "%s{\"titleId\":\"%016llx\",\"version\":%u,\"storage\":\"%s\",\"name\":\"%s\"}",
-            i ? "," : "", (unsigned long long)titles[i].title_id,
-            titles[i].version, storage_label(titles[i].storage_id), name);
+    if (!titles_foreach(offset, limit, titles_json_visit, &j, &total,
+                        err, sizeof(err))) {
+        free(j.buf);
+        http_send_error(req->fd, 500, err[0] ? err : "out of memory listing titles");
+        return;
     }
-    pos += (size_t)snprintf(body + pos, sizeof(body) - pos, "]}");
-    http_send_response(req->fd, 200, "application/json", body, pos);
+    char tail[64];
+    int tn = snprintf(tail, sizeof(tail), "],\"total\":%d,\"offset\":%d}", total, offset);
+    if (!titles_json_append(&j, tail, (size_t)tn)) {
+        free(j.buf);
+        http_send_error(req->fd, 500, "out of memory");
+        return;
+    }
+    http_send_response(req->fd, 200, "application/json", j.buf, j.len);
+    free(j.buf);
 }
 
 // --- /network/dns ------------------------------------------------------------
@@ -517,6 +644,128 @@ static void handle_power_off(HttpRequest *req) {
                  "powering off; physical power button required to turn back on");
 }
 
+// --- /process/* ---------------------------------------------------------------
+
+static void handle_process_current(HttpRequest *req) {
+    bool running = false;
+    u64 pid = 0, title_id = 0;
+    char err[128] = {0};
+    if (!process_get_running(&running, &pid, &title_id, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to get running process");
+        return;
+    }
+    if (running) {
+        http_send_json(req->fd, 200, "{\"running\":true,\"pid\":%llu,\"titleId\":\"%016llx\"}",
+                       (unsigned long long)pid, (unsigned long long)title_id);
+    } else {
+        http_send_json(req->fd, 200, "{\"running\":false}");
+    }
+}
+
+static void handle_process_launch(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0)
+        return;
+    char tid_str[32] = {0};
+    int t = json_obj_get(&doc, root, "title_id");
+    if (t < 0) t = json_obj_get(&doc, root, "titleId");
+    if (t < 0 || !json_get_string(&doc, t, tid_str, sizeof(tid_str))) {
+        http_send_error(req->fd, 400, "missing 'title_id' (16-hex string)");
+        return;
+    }
+    u64 tid = strtoull(tid_str, NULL, 16);
+    if (!tid) {
+        http_send_error(req->fd, 400, "invalid 'title_id'");
+        return;
+    }
+    u64 pid = 0;
+    char err[128] = {0};
+    if (!process_launch_title(tid, &pid, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to launch title");
+        return;
+    }
+    http_send_json(req->fd, 200, "{\"ok\":true,\"pid\":%llu,\"titleId\":\"%016llx\"}",
+                   (unsigned long long)pid, (unsigned long long)tid);
+}
+
+static void handle_process_launch_nro(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0)
+        return;
+    char path[256] = {0}, args[256] = {0}, host_tid_str[32] = {0};
+    int t = json_obj_get(&doc, root, "path");
+    if (t < 0 || !json_get_string(&doc, t, path, sizeof(path)) || path[0] == '\0') {
+        http_send_error(req->fd, 400, "missing 'path' to .nro");
+        return;
+    }
+    t = json_obj_get(&doc, root, "args");
+    if (t >= 0) json_get_string(&doc, t, args, sizeof(args));
+    t = json_obj_get(&doc, root, "host_title_id");
+    if (t < 0) t = json_obj_get(&doc, root, "hostTitleId");
+    if (t >= 0) json_get_string(&doc, t, host_tid_str, sizeof(host_tid_str));
+    u64 host_tid = host_tid_str[0] ? strtoull(host_tid_str, NULL, 16) : 0;
+
+    u64 pid = 0;
+    char err[128] = {0};
+    if (!process_launch_nro(path, args, host_tid, &pid, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to launch NRO");
+        return;
+    }
+    http_send_json(req->fd, 200, "{\"ok\":true,\"pid\":%llu,\"path\":\"%s\"}",
+                   (unsigned long long)pid, path);
+}
+
+static void handle_process_terminate(HttpRequest *req) {
+    char err[128] = {0};
+    if (!process_terminate(err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to terminate process");
+        return;
+    }
+    http_send_json(req->fd, 200, "{\"ok\":true}");
+}
+
+// --- /diagnostics/* -----------------------------------------------------------
+
+static void handle_diagnostics_crash(HttpRequest *req) {
+    char tid_str[32] = {0}, clear_str[16] = {0};
+    http_query_get(req, "title_id", tid_str, sizeof(tid_str));
+    if (!tid_str[0]) http_query_get(req, "titleId", tid_str, sizeof(tid_str));
+    http_query_get(req, "clear", clear_str, sizeof(clear_str));
+
+    u64 tid = tid_str[0] ? strtoull(tid_str, NULL, 16) : 0;
+    bool clear = (strcmp(clear_str, "true") == 0 || strcmp(clear_str, "1") == 0);
+
+    static char log_buf[4096];
+    char filename[128] = {0};
+    bool found = false;
+    char err[128] = {0};
+
+    if (!diagnostics_get_last_crash(tid, clear, log_buf, sizeof(log_buf),
+                                   filename, sizeof(filename), &found, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to read crash report");
+        return;
+    }
+
+    if (!found) {
+        http_send_json(req->fd, 200, "{\"found\":false}");
+        return;
+    }
+
+    size_t llen = strlen(log_buf);
+    size_t esc_len = json_escaped_len(log_buf, llen);
+    char *escaped = malloc(esc_len + 1);
+    if (!escaped) {
+        http_send_error(req->fd, 500, "out of memory");
+        return;
+    }
+    json_escape(log_buf, llen, escaped, esc_len + 1);
+    http_send_json(req->fd, 200, "{\"found\":true,\"filename\":\"%s\",\"content\":\"%s\"}",
+                   filename, escaped);
+    free(escaped);
+}
+
 // --- dispatch ----------------------------------------------------------------
 
 typedef struct {
@@ -527,10 +776,13 @@ typedef struct {
 
 static void handle_controller_attach(HttpRequest *req) { send_input_result(req, input_attach()); }
 static void handle_controller_detach(HttpRequest *req) { send_input_result(req, input_detach()); }
+static void handle_controller_handshake(HttpRequest *req) { send_input_result(req, input_handshake()); }
 static void handle_input_clear(HttpRequest *req)       { send_input_result(req, input_clear()); }
 
 static const Route kRoutes[] = {
     { "GET",    "/screenshot",        handle_screenshot },
+    { "GET",    "/stream",            handle_stream },
+    { "GET",    "/telemetry",         handle_telemetry },
     { "GET",    "/status",            handle_status },
     { "POST",   "/input/tap",         handle_input_tap },
     { "POST",   "/input/hold",        handle_input_hold },
@@ -539,11 +791,20 @@ static const Route kRoutes[] = {
     { "POST",   "/input/clear",       handle_input_clear },
     { "POST",   "/controller/attach", handle_controller_attach },
     { "POST",   "/controller/detach", handle_controller_detach },
+    { "POST",   "/controller/handshake", handle_controller_handshake },
+    { "POST",   "/controller/pair",      handle_controller_handshake },
     { "GET",    "/files",             files_handle_get },
     { "GET",    "/files/hash",        files_handle_hash },
     { "PUT",    "/files",             files_handle_put },
     { "DELETE", "/files",             files_handle_delete },
     { "GET",    "/titles",            handle_titles },
+    { "GET",    "/process",           handle_process_current },
+    { "POST",   "/process/launch",    handle_process_launch },
+    { "POST",   "/process/launch_title", handle_process_launch },
+    { "POST",   "/process/launch-nro",handle_process_launch_nro },
+    { "POST",   "/process/launch_nro",handle_process_launch_nro },
+    { "POST",   "/process/terminate", handle_process_terminate },
+    { "GET",    "/diagnostics/crash", handle_diagnostics_crash },
     { "GET",    "/network/dns",       handle_dns_get },
     { "POST",   "/network/dns",       handle_dns_set },
     { "POST",   "/install",           handle_install },

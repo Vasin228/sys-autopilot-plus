@@ -258,8 +258,14 @@ tools = [
         "description": ("List installed applications (titles) on the console. Returns one line "
                         "per title: 16-hex title id, content-meta version, storage "
                         "(sd/nand/gamecard), and display name. Useful for confirming an install "
-                        "or finding a title id. Lists base applications only (not updates or DLC)."),
-        "inputSchema": {"type": "object", "properties": {}},
+                        "or finding a title id. Lists base applications only (not updates or DLC). "
+                        "Paged: returns up to 'limit' titles (default 256) starting at 'offset'; "
+                        "when more remain, a final line says how many are installed and which "
+                        "offset to pass next."),
+        "inputSchema": {"type": "object", "properties": {
+            "offset": {"type": "integer", "description": "Index of the first title to return. Default 0."},
+            "limit": {"type": "integer", "description": "Maximum titles to return (1-1000). Default 256."},
+        }},
     },
     {
         "name": "get_dns",
@@ -316,6 +322,45 @@ tools = [
             "hour":   {"type": "integer", "description": "0-23"},
             "minute": {"type": "integer", "description": "0-59"},
             "second": {"type": "integer", "description": "0-59"},
+        }},
+    },
+    {
+        "name": "get_running_process",
+        "description": "Get status of the currently active game/application: whether running, PID, and Title ID.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "launch_title",
+        "description": "Launch an installed title by its 16-hex Title ID (e.g. '010000000000100D'). If an app is running, it will be terminated first to release the memory pool.",
+        "inputSchema": {"type": "object", "properties": {
+            "title_id": {"type": "string", "description": "16-hex Title ID of the application to launch."}
+        }, "required": ["title_id"]},
+    },
+    {
+        "name": "launch_nro",
+        "description": "Quick-launch a homebrew .nro executable via hbmenu_nextload. Path on SD card (e.g. '/switch/myapp.nro'), optional arguments and optional host title ID.",
+        "inputSchema": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Absolute path to .nro on SD card (e.g. /switch/myapp/app.nro)."},
+            "args": {"type": "string", "description": "Optional space-separated command-line arguments."},
+            "host_title_id": {"type": "string", "description": "Optional host title ID (defaults to 010000000000100D hbmenu)."}
+        }, "required": ["path"]},
+    },
+    {
+        "name": "terminate_process",
+        "description": "Gracefully terminate the currently active game/application and wait for the memory pool to be released.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_telemetry",
+        "description": "Read comprehensive hardware and runtime telemetry: CPU/GPU/EMC clocks (Hz), SoC/PCB/battery temperatures (C), battery percent and voltage, running process, and active game frame/swap counts.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_last_crash_report",
+        "description": "Read the latest Atmosphere creport crash log from /atmosphere/crash_reports/ (up to 4KB). Optional title_id filter and clear flag.",
+        "inputSchema": {"type": "object", "properties": {
+            "title_id": {"type": "string", "description": "Optional 16-hex Title ID filter."},
+            "clear": {"type": "boolean", "description": "If true, delete the crash report file after reading."}
         }},
     },
 ]

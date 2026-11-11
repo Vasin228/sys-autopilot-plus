@@ -1,10 +1,19 @@
-# sys-autopilot
+# sys-autopilot-plus
 
-A Nintendo Switch (Atmosphère) sysmodule that runs a persistent HTTP server on
+An enhanced Nintendo Switch (Atmosphère) sysmodule that runs a persistent HTTP server on
 the console. It exposes a REST API **and a native MCP (Model Context Protocol)
-endpoint** for taking screenshots, injecting controller input, and
-reading/writing files on the SD card — everything an AI agent needs to drive
-the Switch while testing homebrew applications.
+endpoint** for live video streaming, telemetry, taking screenshots, injecting controller input,
+managing processes, and reading/writing files on the SD card — everything an AI agent needs to drive
+the Switch while testing homebrew applications and commercial titles.
+
+## What's New in sys-autopilot-plus
+
+- 🎥 **Live MJPEG Video Stream (`GET /stream`)**: Real-time video streaming directly to any browser, media player, or vision pipeline via `multipart/x-mixed-replace` with configurable FPS.
+- 📊 **Hardware & System Telemetry (`GET /telemetry`, tool `get_telemetry`)**: Live CPU, GPU, and EMC clock frequencies, SoC and PCB temperatures, battery metrics, active foreground Process ID / Title ID, and frame swap counters.
+- 🎮 **Self-Healing Virtual Controller**: Transparent recovery from Horizon OS HDLS device handle invalidation (`0x1c24ca`) when launching or switching titles. Input delivery remains 100% reliable across application boundaries.
+- 🚀 **Process Lifecycle Management (`/process/*`, tools `launch_title`, `launch_nro`, `terminate_process`)**: Remotely launch installed titles, execute homebrew NROs, or terminate running games.
+- 🩺 **Crash Diagnostics (`GET /diagnostics/crash`, tool `get_crash_report`)**: Automatically read, parse, and analyze the latest Atmosphère crash reports from `sdmc:/atmosphere/crash_reports/`.
+- 🛡️ **Atmosphère 1.11+ & Horizon OS 22.x+ Stability**: Fixed upstream boot crashes (`OutOfSessions` 2021-0003) and memory exhaustion (`ResultLimitReached` 2001-0132) through lazy service initialization and trimmed heap allocation.
 
 Typical agent loop:
 
@@ -29,8 +38,8 @@ make -C app     # builds the dev .nro flavor (see below)
 
 ## Installing
 
-Download the latest `sys-autopilot-<version>.zip` from
-[Releases](https://github.com/TooTallNate/sys-autopilot/releases) and extract
+Download the latest `sys-autopilot-plus-<version>.zip` from
+[Releases](https://github.com/Vasin228/sys-autopilot-plus/releases) and extract
 it to the root of your SD card. Or build from source and copy the contents of
 `dist/` to the root of your SD card:
 
@@ -104,7 +113,7 @@ zeroconf mechanism used by printers and Chromecasts). Two things are exposed:
 
   | TXT key | Example | Meaning |
   |---|---|---|
-  | `version` | `1.3.0` | sys-autopilot version |
+  | `version` | `1.5.0` | sys-autopilot version |
   | `path` | `/mcp` | MCP endpoint path |
   | `auth` | `oauth` / `token` / `none` | Configured auth scheme |
   | `model` | `oled` | Console model (`v1`/`v2`/`lite`/`oled`) |
@@ -203,6 +212,12 @@ Details:
 | `get_brightness` / `set_brightness` | Read / set screen brightness (`0.0`–`1.0`) |
 | `get_volume` / `set_volume` | Read / set master volume (`0.0`–`1.0`) |
 | `airplane_mode` | Enable airplane mode (disable wireless). **One-way: cuts the server off; cannot be undone remotely** |
+| `get_running_process` | Status of foreground title: running state, PID, Title ID |
+| `launch_title` | Launch installed application or title (`title_id: "0100..."`) via `pm:shell` |
+| `launch_nro` | Launch homebrew NRO executable (`path: "/switch/app.nro"`) |
+| `terminate_process` | Gracefully terminate foreground title and wait for memory pool release |
+| `get_telemetry` | Real-time hardware telemetry: CPU/GPU/EMC clocks, SoC/battery temperatures, battery %, foreground process/title ID, display frame stats |
+| `get_last_crash_report` | Fetch and inspect the latest fatal crash report from Atmosphère |
 
 Button names: `A B X Y L R ZL ZR PLUS MINUS UP DOWN LEFT RIGHT LSTICK RSTICK
 HOME CAPTURE` (aliases: `START`, `SELECT`, `DUP/DDOWN/DLEFT/DRIGHT`).
@@ -223,16 +238,23 @@ The `<ip>` in the examples below can be replaced with the console's
 mDNS name (e.g. `switch-5322.local`) — see
 [Network discovery](#network-discovery-mdns--bonjour).
 
-### Screenshots
+### Screenshots & Video Streaming
 
 ```
 GET /screenshot[?stack=screenshot|default|lcd|recording|lastframe]
+GET /stream[?fps=1..30]
 ```
 
-Returns the current screen as `image/jpeg` (1280x720).
+`GET /screenshot` returns the current screen as `image/jpeg` (1280x720).
+
+`GET /stream` provides a continuous multipart/x-mixed-replace MJPEG video stream suitable for embedding in web browsers (`<img src="http://<ip>:4150/stream">`) or reading from video tools (e.g. OpenCV `VideoCapture`, ffmpeg, VLC).
 
 ```sh
+# Fetch a single snapshot
 curl -o screen.jpg http://<switch-ip>:4150/screenshot
+
+# Stream live at 10 FPS (default: 5 FPS, range 1-30)
+curl http://<switch-ip>:4150/stream?fps=10
 ```
 
 ### Controller input
@@ -240,13 +262,16 @@ curl -o screen.jpg http://<switch-ip>:4150/screenshot
 A virtual Pro Controller is attached automatically on the first input request
 (it becomes player 1 when no physical controllers are connected).
 
+**Self-Healing Resilience**: When Horizon OS switches focus between the HOME menu and launched applications, virtual HDLS device handles are invalidated (`0x1c24ca`). `sys-autopilot-plus` automatically detects invalid handles, re-acquires a valid virtual controller within milliseconds, and transparently retries the requested action without dropping input.
+
 ```
-POST /input/tap      {"buttons":["A","B"],"durationMs":100}
+POST /input/tap      {"buttons":["A","B"],"durationMs":200}
 POST /input/hold     {"buttons":["ZL"]}
 POST /input/release  {"buttons":["ZL"]}
 POST /input/stick    {"side":"left","x":1.0,"y":0.0,"durationMs":500}
 POST /input/clear    (empty body)
 POST /controller/attach | /controller/detach
+POST /controller/handshake (or /controller/pair - pulses L+R for 300ms to pair Player 1 in games)
 ```
 
 `x`/`y` are floats in `[-1.0, 1.0]`. With `durationMs`, `/input/stick`
@@ -345,19 +370,33 @@ List the applications installed on the console (base titles only — not updates
 or DLC), across the SD card, internal storage, and an inserted gamecard.
 
 ```
-GET /titles
+GET /titles                       every installed title
+GET /titles?offset=100&limit=50   a window: 50 titles from index 100
 ```
 
 ```json
 {"titles":[
   {"titleId":"0100000000010000","version":0,"storage":"sd","name":"Some Game"},
   {"titleId":"0100000000020000","version":0,"storage":"nand","name":"Another Game"}
-]}
+],"total":2,"offset":0}
 ```
 
-`name` is the title's display name (from its control data); it may be empty if
-the control data isn't available. `storage` is `sd`, `nand`, or `gamecard`.
-Also exposed as the `list_installed_titles` MCP tool.
+With no parameters the response contains every installed title (there is no
+fixed cap). `offset` (default 0) and `limit` (default: no limit) are optional,
+non-negative integers for fetching a window; `total` is always the full number
+of installed titles, so a client can page until `offset + titles.length >=
+total`. An `offset` past the end returns an empty `titles` array; a malformed
+value returns 400. Order is stable between calls (SD card, then internal
+storage, then gamecard) as long as nothing is installed or removed meanwhile.
+
+`name` is the title's display name (from its control data, cut to 79 bytes on a
+character boundary so it is always valid UTF-8); it may be empty if the control
+data isn't available. `storage` is `sd`, `nand`, or `gamecard`.
+
+Also exposed as the `list_installed_titles` MCP tool, which is paged to keep
+model context small: it returns up to `limit` titles (default 256, max 1000)
+starting at `offset`, and when more remain it ends with a line such as
+`(showing 1-256 of 812 installed titles; call again with offset=256 for more)`.
 
 ### Network DNS
 
@@ -431,6 +470,90 @@ curl "http://<ip>:4150/settings/brightness"
 > `POST /settings/airplane` disables all wireless and is **one-way**: the
 > server becomes unreachable and wireless must be re-enabled physically on the
 > console. There is intentionally no remote re-enable.
+
+### Telemetry
+
+Retrieve live hardware clocks, temperatures, battery stats, active process information, and frame presentation counters:
+
+```
+GET /telemetry
+```
+
+```json
+{
+  "clocks": {
+    "cpuHz": 1020000000,
+    "gpuHz": 768000000,
+    "emcHz": 1600000000
+  },
+  "temperatures": {
+    "soc": 39,
+    "pcb": 34,
+    "battery": 32
+  },
+  "battery": {
+    "percent": 100,
+    "charging": true,
+    "voltageMv": 4208
+  },
+  "process": {
+    "running": true,
+    "pid": 85,
+    "titleId": "0100000000001000"
+  },
+  "game": {
+    "active": true,
+    "frames": 12450,
+    "swaps": 12450
+  }
+}
+```
+
+### Process Management
+
+Remotely launch installed software, launch homebrew NROs, or terminate running titles:
+
+```
+POST /process/launch_title    {"titleId":"0100000000010000"}
+POST /process/launch_nro      {"path":"/switch/app.nro"}
+POST /process/terminate       {"titleId":"0100000000010000"}  (or empty body for active process)
+```
+
+```sh
+# Launch an installed title
+curl -X POST http://<ip>:4150/process/launch_title \
+     -H 'Content-Type: application/json' -d '{"titleId":"0100000000010000"}'
+
+# Launch homebrew NRO via hbmenu forwarder
+curl -X POST http://<ip>:4150/process/launch_nro \
+     -H 'Content-Type: application/json' -d '{"path":"/switch/mygame/game.nro"}'
+
+# Close foreground title cleanly
+curl -X POST http://<ip>:4150/process/terminate
+```
+
+### Crash Diagnostics
+
+Inspect the latest fatal crash dump recorded by Atmosphère:
+
+```
+GET /diagnostics/crash
+```
+
+```json
+{
+  "found": true,
+  "filename": "report-00000000-0000-0000-0000-000000000000.log",
+  "content": "Panic Info:\n  Title ID: 0100000000000023\n  Process: am\n  Result: 0x21640e (2001-0132)\n..."
+}
+```
+
+If no crash dump is present:
+```json
+{
+  "found": false
+}
+```
 
 ## Dev flavor (.nro)
 

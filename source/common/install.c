@@ -165,6 +165,18 @@ ContainerKind container_detect(const uint8_t *buf, size_t len,
     return CONTAINER_UNKNOWN;
 }
 
+long install_prefix_read(void *ctx, void *buf, size_t len) {
+    InstallPrefixReader *pr = (InstallPrefixReader *)ctx;
+    if (pr->prefix_len > 0) {
+        size_t take = pr->prefix_len < len ? pr->prefix_len : len;
+        memcpy(buf, pr->prefix, take);
+        pr->prefix += take;
+        pr->prefix_len -= take;
+        return (long)take;
+    }
+    return pr->read_fn(pr->ctx, buf, len);
+}
+
 #ifdef __SWITCH__
 #include <switch.h>
 #include <stdarg.h>
@@ -176,7 +188,7 @@ ContainerKind container_detect(const uint8_t *buf, size_t len,
 
 // --- helpers -----------------------------------------------------------------
 
-#define INSTALL_CHUNK 0x100000            // 1 MiB streaming chunk
+#define INSTALL_CHUNK 0x20000             // 128 KiB streaming chunk
 #define MAX_FILES 64                      // NSP/XCI have a handful of entries
 
 // A unified content entry, with the file's ABSOLUTE byte offset within the
@@ -206,9 +218,13 @@ static u8 g_chunk[INSTALL_CHUNK];
 static bool g_ncm_ok, g_ns_ok, g_es_ok;
 
 bool install_init(void) {
+    if (g_ncm_ok && g_ns_ok)
+        return true;
+    smInitialize();
     g_ncm_ok = R_SUCCEEDED(ncmInitialize());
     g_ns_ok  = R_SUCCEEDED(nsext_init());
     g_es_ok  = R_SUCCEEDED(esext_init());
+    smExit();
     if (!g_ncm_ok) LOGF("install: ncm init failed\n");
     if (!g_ns_ok)  LOGF("install: ns init failed\n");
     if (!g_es_ok)  LOGF("install: es init failed\n");
@@ -708,7 +724,13 @@ static bool install_nsp(InstallReadFn read_fn, void *ctx, NcmStorageId sid,
         entries[i].abs_offset = data_start + pe[i].offset;
         entries[i].size = pe[i].size;
     }
-    return install_entries(read_fn, ctx, consumed, entries, file_count, sid, true, out);
+    // The 0x1104-byte detection prefix usually extends past the PFS0 header
+    // (small NSPs have headers of a few hundred bytes); those leftover bytes
+    // are the start of the first entries, so replay them ahead of the stream.
+    InstallPrefixReader pr = {
+        .read_fn = read_fn, .ctx = ctx, .prefix = prefix, .prefix_len = prefix_len,
+    };
+    return install_entries(install_prefix_read, &pr, consumed, entries, file_count, sid, true, out);
 }
 
 // XCI front-end: skip to the root HFS0, locate the "secure" partition, parse it,
@@ -802,7 +824,7 @@ bool install_stream(InstallReadFn read_fn, void *ctx, uint64_t total_size,
     memset(out, 0, sizeof(*out));
     out->http_status = 200;
 
-    if (!g_ncm_ok || !g_ns_ok) {
+    if (!install_init()) {
         fail(out, 500, "install services unavailable");
         return false;
     }

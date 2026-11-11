@@ -12,6 +12,9 @@
 #include "screen.h"
 #include "settings.h"
 #include "titles.h"
+#include "process.h"
+#include "diagnostics.h"
+#include "telemetry.h"
 #include "network.h"
 #include "log.h"
 #include "mcp_tools.h"
@@ -734,29 +737,74 @@ static void tool_airplane_mode(HttpRequest *req, const char *id) {
                  "wireless is re-enabled physically on the console.");
 }
 
-static void tool_list_titles(HttpRequest *req, const char *id) {
-    static TitleInfo titles[TITLES_MAX];
-    int count = 0;
+// list_installed_titles pages so a console with hundreds of games doesn't
+// flood the model's context; the default matches the old fixed cap.
+#define TITLES_PAGE_DEFAULT 256
+#define TITLES_PAGE_MAX     1000
+#define TITLE_LINE_MAX      160
+
+typedef struct {
+    char *text;
+    size_t pos;
+    int count;
+} TitlesText;
+
+static bool titles_text_visit(const TitleInfo *t, void *ctx) {
+    TitlesText *tt = ctx;
+    const char *storage =
+        t->storage_id == 5 ? "sd" :
+        t->storage_id == 4 ? "nand" :
+        t->storage_id == 2 ? "gamecard" : "other";
+    tt->pos += (size_t)snprintf(tt->text + tt->pos, TITLE_LINE_MAX,
+        "%s%016llx  v%-6u  %-8s  %s", tt->count ? "\n" : "",
+        (unsigned long long)t->title_id, t->version, storage,
+        t->name[0] ? t->name : "(name unavailable)");
+    tt->count++;
+    return true;
+}
+
+static void tool_list_titles(HttpRequest *req, const char *id,
+                             const JsonDoc *doc, int args) {
+    int offset = get_int_or(doc, args, "offset", 0);
+    int limit = get_int_or(doc, args, "limit", TITLES_PAGE_DEFAULT);
+    if (offset < 0)
+        offset = 0;
+    if (limit < 1)
+        limit = 1;
+    if (limit > TITLES_PAGE_MAX)
+        limit = TITLES_PAGE_MAX;
+
+    // Each line is bounded (fixed fields + an 80-byte name), so the page fits.
+    size_t cap = (size_t)limit * TITLE_LINE_MAX + 160;
+    TitlesText tt = { malloc(cap), 0, 0 };
+    if (!tt.text) {
+        send_tool_error(req->fd, id, "out of memory");
+        return;
+    }
+    tt.text[0] = '\0';
+    int total = 0;
     char err[128] = {0};
-    if (!titles_list(titles, TITLES_MAX, &count, err, sizeof(err))) {
+    if (!titles_foreach(offset, limit, titles_text_visit, &tt, &total,
+                        err, sizeof(err))) {
+        free(tt.text);
         send_tool_error(req->fd, id, err[0] ? err : "failed to list titles");
         return;
     }
-    static char text[TITLES_MAX * 128 + 64];
-    size_t pos = 0;
-    if (count == 0)
-        pos += (size_t)snprintf(text, sizeof(text), "(no titles installed)");
-    for (int i = 0; i < count && pos < sizeof(text) - 128; i++) {
-        const char *storage =
-            titles[i].storage_id == 5 ? "sd" :
-            titles[i].storage_id == 4 ? "nand" :
-            titles[i].storage_id == 2 ? "gamecard" : "other";
-        pos += (size_t)snprintf(text + pos, sizeof(text) - pos,
-            "%s%016llx  v%-6u  %-8s  %s", i ? "\n" : "",
-            (unsigned long long)titles[i].title_id, titles[i].version, storage,
-            titles[i].name[0] ? titles[i].name : "(name unavailable)");
-    }
-    send_tool_ok(req->fd, id, text);
+    char *end = tt.text + tt.pos;
+    size_t left = cap - tt.pos;
+    if (total == 0)
+        snprintf(end, left, "(no titles installed)");
+    else if (tt.count == 0)
+        snprintf(end, left, "(no titles at offset %d; %d installed)", offset, total);
+    else if (offset + tt.count < total)
+        snprintf(end, left, "\n(showing %d-%d of %d installed titles; call again "
+                 "with offset=%d for more)", offset + 1, offset + tt.count, total,
+                 offset + tt.count);
+    else if (offset > 0)
+        snprintf(end, left, "\n(showing %d-%d of %d installed titles)",
+                 offset + 1, offset + tt.count, total);
+    send_tool_ok(req->fd, id, tt.text);
+    free(tt.text);
 }
 
 static void tool_get_dns(HttpRequest *req, const char *id) {
@@ -766,7 +814,7 @@ static void tool_get_dns(HttpRequest *req, const char *id) {
         send_tool_error(req->fd, id, err);
         return;
     }
-    char text[128];
+    char text[256];
     if (c.is_automatic)
         snprintf(text, sizeof(text), "automatic (DHCP): primary=%s secondary=%s",
                  c.primary, c.secondary);
@@ -796,7 +844,7 @@ static void tool_set_dns(HttpRequest *req, const char *id,
         send_tool_error(req->fd, id, err);
         return;
     }
-    char text[128];
+    char text[256];
     if (automatic)
         snprintf(text, sizeof(text), "DNS set to automatic (DHCP)");
     else
@@ -890,7 +938,137 @@ static void tool_power(HttpRequest *req, const char *id, PowerAction action,
     power_schedule(action); // executed after this response is flushed
 }
 
+static void tool_get_running_process(HttpRequest *req, const char *id) {
+    bool running = false;
+    u64 pid = 0, title_id = 0;
+    char err[128] = {0};
+    if (!process_get_running(&running, &pid, &title_id, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to get running process");
+        return;
+    }
+    char text[128];
+    if (running) {
+        snprintf(text, sizeof(text), "running: true, pid: %llu, title_id: %016llx",
+                 (unsigned long long)pid, (unsigned long long)title_id);
+    } else {
+        snprintf(text, sizeof(text), "running: false (no active application)");
+    }
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_launch_title(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char tid_str[32] = {0};
+    int t = json_obj_get(doc, args, "title_id");
+    if (t < 0) t = json_obj_get(doc, args, "titleId");
+    if (t < 0 || !json_get_string(doc, t, tid_str, sizeof(tid_str))) {
+        send_tool_error(req->fd, id, "missing 'title_id'");
+        return;
+    }
+    u64 tid = strtoull(tid_str, NULL, 16);
+    if (!tid) {
+        send_tool_error(req->fd, id, "invalid 'title_id'");
+        return;
+    }
+    u64 pid = 0;
+    char err[128] = {0};
+    if (!process_launch_title(tid, &pid, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to launch title");
+        return;
+    }
+    char text[128];
+    snprintf(text, sizeof(text), "launched title %016llx (pid %llu)",
+             (unsigned long long)tid, (unsigned long long)pid);
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_launch_nro(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char path[256] = {0}, cmd_args[256] = {0}, host_tid_str[32] = {0};
+    int t = json_obj_get(doc, args, "path");
+    if (t < 0 || !json_get_string(doc, t, path, sizeof(path)) || path[0] == '\0') {
+        send_tool_error(req->fd, id, "missing 'path'");
+        return;
+    }
+    t = json_obj_get(doc, args, "args");
+    if (t >= 0) json_get_string(doc, t, cmd_args, sizeof(cmd_args));
+    t = json_obj_get(doc, args, "host_title_id");
+    if (t < 0) t = json_obj_get(doc, args, "hostTitleId");
+    if (t >= 0) json_get_string(doc, t, host_tid_str, sizeof(host_tid_str));
+    u64 host_tid = host_tid_str[0] ? strtoull(host_tid_str, NULL, 16) : 0;
+
+    u64 pid = 0;
+    char err[128] = {0};
+    if (!process_launch_nro(path, cmd_args, host_tid, &pid, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to launch NRO");
+        return;
+    }
+    char text[320];
+    snprintf(text, sizeof(text), "launched %s via nextload (pid %llu)", path, (unsigned long long)pid);
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_terminate_process(HttpRequest *req, const char *id) {
+    char err[128] = {0};
+    if (!process_terminate(err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to terminate process");
+        return;
+    }
+    send_tool_ok(req->fd, id, "terminated active application");
+}
+
+static void tool_get_last_crash_report(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char tid_str[32] = {0};
+    bool clear = false;
+    if (args >= 0) {
+        int t = json_obj_get(doc, args, "title_id");
+        if (t < 0) t = json_obj_get(doc, args, "titleId");
+        if (t >= 0) json_get_string(doc, t, tid_str, sizeof(tid_str));
+        t = json_obj_get(doc, args, "clear");
+        if (t >= 0) json_get_bool(doc, t, &clear);
+    }
+    u64 tid = tid_str[0] ? strtoull(tid_str, NULL, 16) : 0;
+
+    static char log_buf[4096];
+    char filename[128] = {0};
+    bool found = false;
+    char err[128] = {0};
+
+    char *body = log_buf + 256;
+    size_t body_max = sizeof(log_buf) - 256;
+
+    if (!diagnostics_get_last_crash(tid, clear, body, body_max,
+                                    filename, sizeof(filename), &found, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to read crash report");
+        return;
+    }
+
+    if (!found) {
+        send_tool_ok(req->fd, id, "(no crash reports found)");
+        return;
+    }
+
+    int hlen = snprintf(log_buf, 256, "=== Crash Report: %s ===\n", filename);
+    if (hlen > 0 && (size_t)hlen < 256) {
+        memmove(log_buf + hlen, body, strlen(body) + 1);
+    }
+    send_tool_ok(req->fd, id, log_buf);
+}
+
 // --- JSON-RPC dispatch -------------------------------------------------------
+
+static void tool_get_telemetry(HttpRequest *req, const char *id) {
+    TelemetryStats stats;
+    if (!telemetry_collect(&stats)) {
+        send_tool_error(req->fd, id, "failed to collect telemetry");
+        return;
+    }
+    char json_buf[1024];
+    int len = telemetry_format_json(&stats, json_buf, sizeof(json_buf));
+    if (len < 0) {
+        send_tool_error(req->fd, id, "failed to format telemetry");
+        return;
+    }
+    send_tool_ok(req->fd, id, json_buf);
+}
 
 static void handle_initialize(HttpRequest *req, const char *id, const JsonDoc *doc, int params) {
     // Respond with the client's protocol version when we know it; otherwise
@@ -965,13 +1143,19 @@ static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *d
     else if (strcmp(name, "set_volume") == 0)
         tool_set_float(req, id, doc, args, "volume", "volume", settings_set_volume);
     else if (strcmp(name, "airplane_mode") == 0)    tool_airplane_mode(req, id);
-    else if (strcmp(name, "list_installed_titles") == 0) tool_list_titles(req, id);
+    else if (strcmp(name, "list_installed_titles") == 0) tool_list_titles(req, id, doc, args);
     else if (strcmp(name, "get_dns") == 0)          tool_get_dns(req, id);
     else if (strcmp(name, "set_dns") == 0)          tool_set_dns(req, id, doc, args);
     else if (strcmp(name, "get_auto_time") == 0)    tool_get_auto_time(req, id);
     else if (strcmp(name, "set_auto_time") == 0)    tool_set_auto_time(req, id, doc, args);
     else if (strcmp(name, "get_datetime") == 0)     tool_get_datetime(req, id);
     else if (strcmp(name, "set_datetime") == 0)     tool_set_datetime(req, id, doc, args);
+    else if (strcmp(name, "get_running_process") == 0)   tool_get_running_process(req, id);
+    else if (strcmp(name, "launch_title") == 0)          tool_launch_title(req, id, doc, args);
+    else if (strcmp(name, "launch_nro") == 0)            tool_launch_nro(req, id, doc, args);
+    else if (strcmp(name, "terminate_process") == 0)     tool_terminate_process(req, id);
+    else if (strcmp(name, "get_last_crash_report") == 0) tool_get_last_crash_report(req, id, doc, args);
+    else if (strcmp(name, "get_telemetry") == 0)         tool_get_telemetry(req, id);
     else send_rpc_error(req->fd, id, -32602, "unknown tool");
 }
 

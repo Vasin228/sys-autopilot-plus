@@ -23,7 +23,7 @@ APP_TITLE	:=	sys-autopilot
 APP_AUTHOR	:=	TooTallNate
 
 # Version is managed by changesets in package.json.
-APP_VERSION	:=	$(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' $(TOPDIR)/../package.json)
+APP_VERSION	:=	$(shell sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' $(CURDIR)/../package.json 2>/dev/null || sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' $(TOPDIR)/package.json 2>/dev/null)
 
 #---------------------------------------------------------------------------------
 # options for code generation

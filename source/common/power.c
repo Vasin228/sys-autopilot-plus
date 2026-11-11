@@ -27,19 +27,39 @@ static PscPmState g_pending_state;
 static bool g_initialized;
 
 bool power_init(void) {
-    Result rc = pscmInitialize();
+    // Register with PSC so we receive sleep/wake notifications.
+    // We MUST close sockets before acknowledging a sleep request; otherwise
+    // bsdsockets aborts and the console reboots on wake instead of resuming.
+    //
+    // Historical note: an earlier attempt (commit 6199866) disabled this because
+    // 2001-0132 (AM ResultLimitReached) was seen.  That crash came from
+    // install.c eagerly opening ns/ncm at boot and from excessive handle_table
+    // quota — both are now fixed.  PSC itself does not conflict with AM.
+    //
+    // Call this while an sm session is still open (i.e. from __appInit before
+    // smExit()).  Dependency on PscPmModuleId_Fs ensures we are notified early
+    // in the sleep sequence (before fsp-srv suspends) so our SD-card log flush
+    // in log_set_suspended() always completes safely.
+    Result rc = 0;
+    for (int i = 0; i < 20; i++) {
+        rc = pscmInitialize();
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(500000000ULL);
+    }
     if (R_FAILED(rc)) {
         LOGF("power: pscmInitialize failed rc=0x%x\n", rc);
         return false;
     }
 
-    // Declaring Fs as a dependency makes PSC notify us early in the sleep
-    // sequence (and late in the wake sequence). This matches working
-    // sysmodules in the wild (kdeconnect-nx); referencing modules that may
-    // not be registered (e.g. WlanSockets) risks breaking psc's dispatch.
     static const u32 deps[] = { PscPmModuleId_Fs };
-    rc = pscmGetPmModule(&g_module, POWER_MODULE_ID, deps,
-                         sizeof(deps) / sizeof(deps[0]), true);
+    for (int i = 0; i < 20; i++) {
+        rc = pscmGetPmModule(&g_module, POWER_MODULE_ID, deps,
+                             sizeof(deps) / sizeof(deps[0]), true);
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(500000000ULL);
+    }
     if (R_FAILED(rc)) {
         LOGF("power: pscmGetPmModule failed rc=0x%x\n", rc);
         pscmExit();

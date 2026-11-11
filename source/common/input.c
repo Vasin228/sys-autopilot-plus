@@ -92,15 +92,21 @@ Result input_attach(void) {
     // Push an initial neutral state so the controller registers.
     memset(&g_state, 0, sizeof(g_state));
     g_state.battery_level = 4;
-    return hiddbgSetHdlsState(g_handle, &g_state);
+    g_state.flags = 1; // IsPowered
+    rc = hiddbgSetHdlsState(g_handle, &g_state);
+    if (R_FAILED(rc)) {
+        LOGF("input: initial set_state failed rc=0x%x\n", rc);
+        g_attached = false;
+        hiddbgDetachHdlsVirtualDevice(g_handle);
+    }
+    return rc;
 }
 
 Result input_detach(void) {
     if (!g_attached)
         return 0;
     Result rc = hiddbgDetachHdlsVirtualDevice(g_handle);
-    if (R_SUCCEEDED(rc))
-        g_attached = false;
+    g_attached = false;
     return rc;
 }
 
@@ -109,7 +115,21 @@ bool input_is_attached(void) {
 }
 
 static Result apply_state(void) {
-    return hiddbgSetHdlsState(g_handle, &g_state);
+    Result rc = hiddbgSetHdlsState(g_handle, &g_state);
+    if (R_FAILED(rc)) {
+        LOGF("input: apply_state failed rc=0x%x, retrying with fresh device\n", rc);
+        g_attached = false;
+        hiddbgDetachHdlsVirtualDevice(g_handle);
+        HiddbgHdlsState desired = g_state;
+        rc = input_attach();
+        if (R_SUCCEEDED(rc)) {
+            g_state = desired;
+            g_state.battery_level = 4;
+            g_state.flags = 1; // IsPowered
+            rc = hiddbgSetHdlsState(g_handle, &g_state);
+        }
+    }
+    return rc;
 }
 
 static int clamp_duration(int ms) {
@@ -118,6 +138,10 @@ static int clamp_duration(int ms) {
     if (ms > INPUT_MAX_DURATION_MS)
         return INPUT_MAX_DURATION_MS;
     return ms;
+}
+
+Result input_handshake(void) {
+    return input_tap(BTN_L | BTN_R, 300);
 }
 
 Result input_tap(u64 mask, int duration_ms) {

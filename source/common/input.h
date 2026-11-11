@@ -2,7 +2,7 @@
 
 #include <switch.h>
 
-#define INPUT_DEFAULT_TAP_MS 100
+#define INPUT_DEFAULT_TAP_MS 200
 #define INPUT_MAX_DURATION_MS 10000
 
 // Detaches the virtual device and releases the HDLS work buffer. MUST be
@@ -18,6 +18,7 @@ void input_exit(void);
 Result input_attach(void);
 Result input_detach(void);
 bool   input_is_attached(void);
+Result input_handshake(void);
 
 // Press+release: applies mask, sleeps duration_ms, releases mask.
 Result input_tap(u64 mask, int duration_ms);

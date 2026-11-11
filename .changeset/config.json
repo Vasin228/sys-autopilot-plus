@@ -2,7 +2,7 @@
   "$schema": "https://unpkg.com/@changesets/config@3.1.4/schema.json",
   "changelog": [
     "../scripts/changelog-github.mjs",
-    { "repo": "TooTallNate/sys-autopilot" }
+    { "repo": "Vasin228/sys-autopilot-plus" }
   ],
   "commit": false,
   "fixed": [],
