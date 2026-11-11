@@ -16,7 +16,7 @@
 // Inner heap: socket transfer memory + stdio buffers + dir listing JSON +
 // headroom for the title installer (ncm IPC, mounting the cnmt NCA). The large
 // fixed buffers (JPEG, I/O, HDLS workmem, install chunk) are static bss.
-#define INNER_HEAP_SIZE 0x400000
+#define INNER_HEAP_SIZE 0x100000
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,81 +55,102 @@ static const SocketInitConfig kSocketConfig = {
     // the persistent mDNS/DNS-SD UDP socket. 3 is the minimum; use 4 for a
     // little headroom.
     .num_bsd_sessions    = 4,
-    .bsd_service_type    = BsdServiceType_User,
+    // Sysmodules in pool_partition 2 need bsd:s (system socket service).
+    // BsdServiceType_Auto tries bsd:s first, then falls back to bsd:u.
+    .bsd_service_type    = BsdServiceType_Auto,
 };
 
 void __appInit(void)
 {
     Result rc;
 
-    rc = smInitialize();
-    if (R_FAILED(rc))
-        diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_SM));
-
-    rc = setsysInitialize();
-    if (R_SUCCEEDED(rc)) {
-        SetSysFirmwareVersion fw;
-        rc = setsysGetFirmwareVersion(&fw);
+    // 1. SM: In early boot (Atmosphere boot2), SM might still be initializing.
+    // Retry up to 30 times (15 seconds) before giving up.
+    rc = MAKERESULT(Module_Libnx, LibnxError_InitFail_SM);
+    for (int i = 0; i < 30; i++) {
+        rc = smInitialize();
         if (R_SUCCEEDED(rc))
-            hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
-        setsysExit();
+            break;
+        svcSleepThread(500000000ULL);
+    }
+    if (R_FAILED(rc))
+        return;
+
+    // 2. Horizon Firmware Version: must be retrieved before other services
+    // (such as hid and caps) query hosversionGet().
+    for (int i = 0; i < 30; i++) {
+        if (R_SUCCEEDED(setsysInitialize())) {
+            SetSysFirmwareVersion fw;
+            if (R_SUCCEEDED(setsysGetFirmwareVersion(&fw))) {
+                hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
+                setsysExit();
+                break;
+            }
+            setsysExit();
+        }
+        svcSleepThread(500000000ULL);
     }
 
-    rc = fsInitialize();
-    if (R_FAILED(rc))
-        diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_InitFail_FS));
+    // 3. Filesystem and SDMC: at boot, fsp-srv takes several seconds to detect and mount SD card.
+    for (int i = 0; i < 30; i++) {
+        rc = fsInitialize();
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(500000000ULL);
+    }
 
-    rc = fsdevMountSdmc();
-    if (R_FAILED(rc))
-        diagAbortWithResult(rc);
+    for (int i = 0; i < 60; i++) {
+        rc = fsdevMountSdmc();
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(500000000ULL);
+    }
 
-    rc = hiddbgInitialize();
-    if (R_FAILED(rc))
-        diagAbortWithResult(rc);
+    // 4. HID Debug (controller emulation)
+    for (int i = 0; i < 30; i++) {
+        rc = hiddbgInitialize();
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(500000000ULL);
+    }
 
-    rc = capsscInitialize();
-    if (R_FAILED(rc))
-        diagAbortWithResult(rc);
-
-    // Optional: wall-clock time for OAuth token issuance stamps.
+    // 5. Optional: wall-clock time for OAuth token issuance stamps.
     rc = timeInitialize();
     if (R_SUCCEEDED(rc))
         __libnx_init_time();
 
-    rc = socketInitialize(&kSocketConfig);
-    if (R_FAILED(rc))
-        diagAbortWithResult(rc);
+    // 7. BSD socket service: bsd:u is started later in the boot sequence.
+    // Retry up to 60 times (30 seconds) until the network stack is up.
+    for (int i = 0; i < 60; i++) {
+        rc = socketInitialize(&kSocketConfig);
+        if (R_SUCCEEDED(rc))
+            break;
+        svcSleepThread(500000000ULL);
+    }
 
-    // Register with PSC so we can quiesce sockets across sleep (must happen
-    // while the sm session is open). Failure is non-fatal but means sleep
-    // will crash the console, so abort loudly in that case.
-    if (!power_init())
-        diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_NotFound));
+    // 8. PSC power module: MUST be registered while SM is still open (before
+    // smExit). Calling this later (after smExit) silently fails on Horizon
+    // because pscmInitialize internally calls smGetService.
+    // Non-fatal: if PSC is unavailable (rare on >=FW18), the server continues
+    // without sleep/wake quiescing; the console will reboot on wake instead of
+    // resuming, which matches the old behaviour and is better than a boot crash.
+    power_init();
 
-    // For agent-requested sleep/restart/power-off. Non-fatal when missing:
-    // the endpoints report unavailability.
+    // 9. SPSM for agent-requested sleep/restart/power-off.
     power_spsm_init();
 
-    // Gather device facts (model/firmware/Atmosphère) for the mDNS TXT record
-    // now, while the sm session is still open: the underlying set:sys/spl
-    // smGetService calls would fail after smExit(). Best-effort; failures just
-    // leave the corresponding TXT fields empty.
+    // 10. Device facts (model/firmware/Atmosphère) for mDNS TXT records.
     device_info_init();
 
-    // Network Interface Manager: nifm gives us the real LAN IP for mDNS
-    // (gethostid() only ever returns loopback in a sysmodule). Must be opened
-    // while sm is up; the session is held for the process lifetime.
-    if (!netif_init())
-        LOGF("netif: nifm init failed; mDNS A records unavailable\n");
+    // 11. Network Interface Manager (nifm) for real LAN IP.
+    for (int i = 0; i < 30; i++) {
+        if (netif_init())
+            break;
+        svcSleepThread(500000000ULL);
+    }
 
-    // System-settings services (lbl/audctl/psm) for the settings tools. Opened
-    // while sm is up; best-effort (a missing service just disables its tool).
+    // 12. System settings (lbl/audctl/psm)
     settings_init();
-
-    // Title installation services (ncm/ns/es). Opened while sm is up; if these
-    // fail the /install endpoint reports unavailability.
-    if (!install_init())
-        LOGF("install: services unavailable; /install disabled\n");
 
     smExit();
 }
@@ -143,7 +164,6 @@ void __appExit(void)
     power_exit();
     timeExit();
     socketExit();
-    capsscExit();
     hiddbgExit();
     fsdevUnmountAll();
     fsExit();

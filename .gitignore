@@ -9,3 +9,12 @@ dist/
 *.map
 node_modules/
 .DS_Store
+*.zip
+PROJECT_OVERVIEW.md
+scripts/fetch_log.py
+scripts/quick_deploy.py
+scripts/switch_runner.py
+scripts/test_mcp_client.py
+scripts/wait_boot_and_test.py
+scripts/wait_for_autopilot.py
+

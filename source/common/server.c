@@ -6,6 +6,7 @@
 #include "oauth.h"
 #include "power.h"
 #include "routes.h"
+#include "screen.h"
 #include "log.h"
 
 #include <stdio.h>
@@ -24,6 +25,34 @@ static bool set_nonblocking(int fd) {
     if (flags < 0)
         return false;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+static int g_stream_fd = -1;
+static u64 g_stream_interval_ns = 100000000ULL;
+static u64 g_stream_last_frame_tick = 0;
+static ViLayerStack g_stream_stack = ViLayerStack_Screenshot;
+
+void server_start_stream(int fd, int fps, ViLayerStack stack) {
+    if (g_stream_fd >= 0 && g_stream_fd != fd) {
+        close(g_stream_fd);
+        g_stream_fd = -1;
+    }
+    if (fps <= 0) fps = 10;
+    if (fps > 30) fps = 30;
+    g_stream_interval_ns = (u64)(1000000000ULL / (u64)fps);
+    g_stream_stack = stack;
+    g_stream_last_frame_tick = 0;
+    g_stream_fd = fd;
+    set_nonblocking(fd);
+    LOGF("server: stream started fd=%d fps=%d\n", fd, fps);
+}
+
+void server_stop_stream(void) {
+    if (g_stream_fd >= 0) {
+        LOGF("server: stream closed fd=%d\n", g_stream_fd);
+        close(g_stream_fd);
+        g_stream_fd = -1;
+    }
 }
 
 static int create_listener(int port) {
@@ -131,7 +160,11 @@ static void handle_connection(int fd, const Config *cfg) {
     // clients reuse the socket across initialize -> initialized -> tools/list,
     // so closing after each response broke their transport.
     for (int served = 0; served < 64; served++) {
+        if (fd == g_stream_fd)
+            break;
         if (handle_one(fd, cfg) != CONN_KEEP)
+            break;
+        if (fd == g_stream_fd)
             break;
         // Keep-alive: only stay if the next request is already arriving. The
         // server is single-threaded, so blocking here on a quiet socket would
@@ -197,6 +230,7 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
             // to the SD card, so it must stay silent across the whole window.
             LOGF("server: power: sleeping, releasing sockets + HDLS\n");
             log_set_suspended(true);
+            server_stop_stream();
             if (listen_fd >= 0) {
                 close(listen_fd);
                 listen_fd = -1;
@@ -238,6 +272,7 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
             netcheck_ticks = 0;
             if (netif_ipv4_changed()) {
                 LOGF("server: IP changed; rebuilding sockets\n");
+                server_stop_stream();
                 if (listen_fd >= 0) {
                     close(listen_fd);
                     listen_fd = -1;
@@ -301,14 +336,43 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
             pfds[nfds].revents = 0;
             nfds++;
         }
-        int pr = poll(pfds, nfds, 100);
+        int poll_timeout = (g_stream_fd >= 0) ? 30 : 100;
+        int pr = poll(pfds, nfds, poll_timeout);
 
         if (idle && !idle())
             break;
 
+        if (g_stream_fd >= 0) {
+            struct pollfd spfd = { .fd = g_stream_fd, .events = POLLERR | POLLHUP };
+            if (poll(&spfd, 1, 0) > 0 && (spfd.revents & (POLLERR | POLLHUP))) {
+                server_stop_stream();
+            } else {
+                u64 now = armGetSystemTick();
+                u64 elapsed_ns = armTicksToNs(now - g_stream_last_frame_tick);
+                if (elapsed_ns >= g_stream_interval_ns) {
+                    const u8 *jpeg = NULL;
+                    u64 size = 0;
+                    Result rc = screen_capture_jpeg(g_stream_stack, &jpeg, &size);
+                    if (R_SUCCEEDED(rc) && size > 0) {
+                        char part_hdr[128];
+                        int plen = snprintf(part_hdr, sizeof(part_hdr),
+                            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %llu\r\n\r\n",
+                            (unsigned long long)size);
+                        if (!http_write_all(g_stream_fd, part_hdr, plen) ||
+                            !http_write_all(g_stream_fd, jpeg, (size_t)size) ||
+                            !http_write_all(g_stream_fd, "\r\n", 2)) {
+                            server_stop_stream();
+                        }
+                    }
+                    g_stream_last_frame_tick = armGetSystemTick();
+                }
+            }
+        }
+
         if (pr < 0) {
             // bsd service hiccup; rebuild both sockets.
             LOGF("server: poll failed (errno=%d), rebuilding listener\n", errno);
+            server_stop_stream();
             close(listen_fd);
             listen_fd = -1;
             if (mdns_fd >= 0) {
@@ -340,8 +404,10 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
         handle_connection(client, cfg);
         // Half-close the write side first so the peer reliably sees a FIN
         // (not an RST from leftover unread bytes), then close.
-        shutdown(client, SHUT_WR);
-        close(client);
+        if (client != g_stream_fd) {
+            shutdown(client, SHUT_WR);
+            close(client);
+        }
 
         // Agent-requested power action: executed only after the response has
         // been sent and the connection closed, so the client gets its
@@ -357,6 +423,7 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
         }
     }
 
+    server_stop_stream();
     http_set_idle_callback(NULL);
     if (listen_fd >= 0)
         close(listen_fd);

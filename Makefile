@@ -120,9 +120,13 @@ dist: all
 	@rm -rf dist
 	@mkdir -p dist/atmosphere/contents/$(TITLE_ID)/flags
 	@mkdir -p dist/config/sys-autopilot
+	@mkdir -p dist/switch/sys-autopilot
 	@cp $(TARGET).nsp dist/atmosphere/contents/$(TITLE_ID)/exefs.nsp
 	@touch dist/atmosphere/contents/$(TITLE_ID)/flags/boot2.flag
+	@cp toolbox.json dist/atmosphere/contents/$(TITLE_ID)/toolbox.json
 	@cp default-config.ini dist/config/sys-autopilot/config.ini
+	@$(MAKE) -C app
+	@cp app/sys-autopilot-app.nro dist/switch/sys-autopilot/sys-autopilot.nro
 	@echo "SD card layout written to dist/"
 
 #---------------------------------------------------------------------------------
