@@ -25,12 +25,8 @@ extern "C" {
 u32 __nx_applet_type = AppletType_None;
 u32 __nx_fs_num_sessions = 1;
 
-// Sysmodules use time:s (the npdm grants it); used for the OAuth
-// "# issued <date>" stamps and the read-only get_datetime tool.
+// Sysmodules use time:s (the npdm grants it); used for on-demand datetime tools.
 u32 __nx_time_service_type = TimeServiceType_System;
-
-// Internal libnx helper that wires newlib's time() to the time service.
-void __libnx_init_time(void);
 
 void __libnx_initheap(void)
 {
@@ -114,11 +110,6 @@ void __appInit(void)
         svcSleepThread(500000000ULL);
     }
 
-    // 5. Optional: wall-clock time for OAuth token issuance stamps.
-    rc = timeInitialize();
-    if (R_SUCCEEDED(rc))
-        __libnx_init_time();
-
     // 7. BSD socket service: bsd:u is started later in the boot sequence.
     // Retry up to 60 times (30 seconds) until the network stack is up.
     for (int i = 0; i < 60; i++) {
@@ -162,7 +153,6 @@ void __appExit(void)
     netif_exit();
     power_spsm_exit();
     power_exit();
-    timeExit();
     socketExit();
     hiddbgExit();
     fsdevUnmountAll();

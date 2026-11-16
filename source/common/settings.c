@@ -172,15 +172,25 @@ bool settings_set_auto_time(bool enabled) {
 // --- date / time / timezone ---------------------------------------------------
 
 bool settings_get_datetime(DateTime *out) {
-    // time is initialized in __appInit (TimeServiceType_System).
-    u64 ts = 0;
-    if (R_FAILED(timeGetCurrentTime(TimeType_UserSystemClock, &ts)))
+    smInitialize();
+    Result rc = timeInitialize();
+    smExit();
+    if (R_FAILED(rc))
         return false;
+
+    u64 ts = 0;
+    rc = timeGetCurrentTime(TimeType_UserSystemClock, &ts);
+    if (R_FAILED(rc)) {
+        timeExit();
+        return false;
+    }
 
     TimeCalendarTime cal = {0};
     TimeCalendarAdditionalInfo info = {0};
-    if (R_FAILED(timeToCalendarTimeWithMyRule(ts, &cal, &info)))
+    if (R_FAILED(timeToCalendarTimeWithMyRule(ts, &cal, &info))) {
+        timeExit();
         return false;
+    }
 
     out->year   = cal.year;
     out->month  = cal.month;
@@ -194,10 +204,18 @@ bool settings_get_datetime(DateTime *out) {
         snprintf(out->timezone, sizeof(out->timezone), "%s", loc.name);
     else
         out->timezone[0] = '\0';
+
+    timeExit();
     return true;
 }
 
 bool settings_set_datetime(const DateTime *dt) {
+    smInitialize();
+    Result rc = timeInitialize();
+    smExit();
+    if (R_FAILED(rc))
+        return false;
+
     // Convert the wall-clock fields (interpreted in the device's current
     // timezone) to a POSIX timestamp.
     TimeCalendarTime cal = {0};
@@ -210,13 +228,16 @@ bool settings_set_datetime(const DateTime *dt) {
 
     u64 posix = 0;
     s32 count = 0;
-    if (R_FAILED(timeToPosixTimeWithMyRule(&cal, &posix, 1, &count)) || count < 1)
+    if (R_FAILED(timeToPosixTimeWithMyRule(&cal, &posix, 1, &count)) || count < 1) {
+        timeExit();
         return false;
+    }
 
     // Write the NETWORK system clock: that's the one a sysmodule is permitted
     // to set (the user/local clocks reject it with rc 0x274), and the displayed
     // time follows it. Verified on hardware fixing a badly-skewed clock.
-    Result rc = timeSetCurrentTime(TimeType_NetworkSystemClock, posix);
+    rc = timeSetCurrentTime(TimeType_NetworkSystemClock, posix);
+    timeExit();
     if (R_FAILED(rc)) {
         LOGF("settings: SetCurrentTime(Network) rc=0x%x\n", rc);
         return false;

@@ -277,3 +277,15 @@ Key root causes identified:
   - Host tests (`./tests/run.sh`) passed including new `touch_screen` and `files put atomic` cases.
   - Built `exefs.nsp` (264,702 bytes, SHA256: `457bd0ae4ff103bdb99dd85fce785054ccc25dae90c0b72f8a7ddb2fe412ec4a`) and deployed via OTA.
   - Verified live on Switch: `POST /input/touch` (both tap and swipe gestures) successfully navigated and scrolled the Home Menu.
+
+### 14. Fix for Time Service Session Exhaustion (v1.5.3-plus)
+- **Symptom**: Sphaira launcher crashes on startup with fatal error `2345-0038` (`0x64274`, `LibnxError_InitFail_Time` / out of sessions) on firmware packs with multiple active sysmodules/overlays (HOS 21.2, ultranx 3.0 R4).
+- **Root Cause**: In `source/main.c`, `timeInitialize()` was called unconditionally in `__appInit` at boot and held open for the lifetime of the process. Horizon OS `time:s` service has very few concurrent sessions; holding one continuously caused other homebrew applications to exceed the session limit on startup.
+- **Fix**:
+  - Removed persistent `timeInitialize()` and `__libnx_init_time()` from `__appInit` and `__appExit` in `main.c`.
+  - Converted time service access in `settings_get_datetime()` and `settings_set_datetime()` (`settings.c`) and token stamp generation (`oauth.c`) to on-demand lazy acquisition (`smInitialize(); timeInitialize(); smExit(); ... timeExit();`).
+  - Sysmodule now holds 0 open sessions to the `time` service during idle operation.
+- **Verification**:
+  - All host tests (`./tests/run.sh`) passed.
+  - Recompiled with devkitA64 (`make dist`): `exefs.nsp` (263,177 bytes, SHA256: `5236E9714F33F564E23224666F397DDD817449C493A1FDCCC7201F272A84D618`).
+  - Packaged `sys-autopilot-plus-v1.5.3.zip` (419,400 bytes).

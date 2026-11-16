@@ -172,12 +172,27 @@ static bool tokens_append(const char *token, const char *note) {
     if (!f)
         return false;
     char stamp[64] = "";
+#ifdef __SWITCH__
+    smInitialize();
+    if (R_SUCCEEDED(timeInitialize())) {
+        u64 posix = 0;
+        if (R_SUCCEEDED(timeGetCurrentTime(TimeType_UserSystemClock, &posix)) && posix > 1600000000ULL) {
+            time_t t = (time_t)posix;
+            struct tm tmv;
+            gmtime_r(&t, &tmv);
+            strftime(stamp, sizeof(stamp), " issued %Y-%m-%dT%H:%M:%SZ", &tmv);
+        }
+        timeExit();
+    }
+    smExit();
+#else
     time_t t = time(NULL);
     if (t > 1600000000) {
         struct tm tmv;
         gmtime_r(&t, &tmv);
         strftime(stamp, sizeof(stamp), " issued %Y-%m-%dT%H:%M:%SZ", &tmv);
     }
+#endif
     fprintf(f, "%s #%s %s\n", token, stamp, note ? note : "");
     fclose(f);
 

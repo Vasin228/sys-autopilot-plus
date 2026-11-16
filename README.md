@@ -113,7 +113,7 @@ zeroconf mechanism used by printers and Chromecasts). Two things are exposed:
 
   | TXT key | Example | Meaning |
   |---|---|---|
-  | `version` | `1.5.2` | sys-autopilot version |
+  | `version` | `1.5.3` | sys-autopilot version |
   | `path` | `/mcp` | MCP endpoint path |
   | `auth` | `oauth` / `token` / `none` | Configured auth scheme |
   | `model` | `oled` | Console model (`v1`/`v2`/`lite`/`oled`) |
