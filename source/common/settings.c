@@ -12,101 +12,123 @@
 // system Quick Settings slider controls for the active output.
 #define VOLUME_TARGET AudioTarget_Speaker
 
-static bool g_setsys_ok;
-static bool g_lbl_ok;
-static bool g_audctl_ok;
-static bool g_psm_ok;
+static inline Result init_setsys(void) {
+    smInitialize();
+    Result rc = setsysInitialize();
+    smExit();
+    return rc;
+}
+
+static inline Result init_lbl(void) {
+    smInitialize();
+    Result rc = lblInitialize();
+    smExit();
+    return rc;
+}
+
+static inline Result init_audctl(void) {
+    smInitialize();
+    Result rc = audctlInitialize();
+    smExit();
+    return rc;
+}
+
+static inline Result init_psm(void) {
+    smInitialize();
+    Result rc = psmInitialize();
+    smExit();
+    return rc;
+}
 
 void settings_init(void) {
-    // set:sys must be opened here, while the sm session is still open: it is
-    // used by theme/nickname/auto-time, and a later setsysInitialize() after
-    // smExit() would fail. Holding this reference keeps the session alive for
-    // the process lifetime (setsysInitialize is refcounted).
-    g_setsys_ok = R_SUCCEEDED(setsysInitialize());
-    g_lbl_ok    = R_SUCCEEDED(lblInitialize());
-    g_audctl_ok = R_SUCCEEDED(audctlInitialize());
-    g_psm_ok    = R_SUCCEEDED(psmInitialize());
-    if (!g_setsys_ok) LOGF("settings: set:sys init failed\n");
-    if (!g_lbl_ok)    LOGF("settings: lbl init failed\n");
-    if (!g_audctl_ok) LOGF("settings: audctl init failed\n");
-    if (!g_psm_ok)    LOGF("settings: psm init failed\n");
+    // Intentionally empty: all Horizon services are now opened lazily on demand
+    // to avoid holding persistent sessions in the background.
 }
 
 void settings_exit(void) {
-    if (g_setsys_ok) { setsysExit(); g_setsys_ok = false; }
-    if (g_lbl_ok)    { lblExit();    g_lbl_ok = false; }
-    if (g_audctl_ok) { audctlExit(); g_audctl_ok = false; }
-    if (g_psm_ok)    { psmExit();    g_psm_ok = false; }
+    // Intentionally empty: all lazy sessions are closed immediately after each request.
 }
 
 // --- theme --------------------------------------------------------------------
 
 bool settings_get_theme(bool *out_dark) {
-    if (!g_setsys_ok)
+    if (R_FAILED(init_setsys()))
         return false;
     ColorSetId id = ColorSetId_Light;
-    if (R_FAILED(setsysGetColorSetId(&id)))
+    Result rc = setsysGetColorSetId(&id);
+    setsysExit();
+    if (R_FAILED(rc))
         return false;
     *out_dark = (id == ColorSetId_Dark);
     return true;
 }
 
 bool settings_set_theme(bool dark) {
-    if (!g_setsys_ok)
+    if (R_FAILED(init_setsys()))
         return false;
-    return R_SUCCEEDED(
-        setsysSetColorSetId(dark ? ColorSetId_Dark : ColorSetId_Light));
+    Result rc = setsysSetColorSetId(dark ? ColorSetId_Dark : ColorSetId_Light);
+    setsysExit();
+    return R_SUCCEEDED(rc);
 }
 
 // --- nickname -----------------------------------------------------------------
 
 bool settings_get_nickname(char *out, size_t outsz) {
-    if (!g_setsys_ok)
+    if (R_FAILED(init_setsys()))
         return false;
     SetSysDeviceNickName nn = {0};
-    if (R_FAILED(setsysGetDeviceNickname(&nn)))
+    Result rc = setsysGetDeviceNickname(&nn);
+    setsysExit();
+    if (R_FAILED(rc))
         return false;
     snprintf(out, outsz, "%s", nn.nickname);
     return true;
 }
 
 bool settings_set_nickname(const char *name) {
-    if (!g_setsys_ok)
+    if (R_FAILED(init_setsys()))
         return false;
     SetSysDeviceNickName nn = {0};
     snprintf(nn.nickname, sizeof(nn.nickname), "%s", name);
-    return R_SUCCEEDED(setsysSetDeviceNickname(&nn));
+    Result rc = setsysSetDeviceNickname(&nn);
+    setsysExit();
+    return R_SUCCEEDED(rc);
 }
 
 // --- brightness ---------------------------------------------------------------
 
 bool settings_get_brightness(float *out) {
-    if (!g_lbl_ok)
+    if (R_FAILED(init_lbl()))
         return false;
-    return R_SUCCEEDED(lblGetCurrentBrightnessSetting(out));
+    Result rc = lblGetCurrentBrightnessSetting(out);
+    lblExit();
+    return R_SUCCEEDED(rc);
 }
 
 bool settings_set_brightness(float value) {
-    if (!g_lbl_ok)
-        return false;
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
-    if (R_FAILED(lblSetCurrentBrightnessSetting(value)))
+    if (R_FAILED(init_lbl()))
         return false;
-    // Apply immediately so the change is visible without a settings round-trip.
-    lblApplyCurrentBrightnessSettingToBacklight();
-    return true;
+    Result rc = lblSetCurrentBrightnessSetting(value);
+    if (R_SUCCEEDED(rc)) {
+        lblApplyCurrentBrightnessSettingToBacklight();
+    }
+    lblExit();
+    return R_SUCCEEDED(rc);
 }
 
 // --- volume -------------------------------------------------------------------
 
 bool settings_get_volume(float *out) {
-    if (!g_audctl_ok)
+    if (R_FAILED(init_audctl()))
         return false;
     s32 vol = 0, vmin = 0, vmax = 0;
-    if (R_FAILED(audctlGetTargetVolume(&vol, VOLUME_TARGET)) ||
-        R_FAILED(audctlGetTargetVolumeMin(&vmin)) ||
-        R_FAILED(audctlGetTargetVolumeMax(&vmax)))
+    Result rc1 = audctlGetTargetVolume(&vol, VOLUME_TARGET);
+    Result rc2 = audctlGetTargetVolumeMin(&vmin);
+    Result rc3 = audctlGetTargetVolumeMax(&vmax);
+    audctlExit();
+    if (R_FAILED(rc1) || R_FAILED(rc2) || R_FAILED(rc3))
         return false;
     if (vmax <= vmin) {
         *out = 0.0f;
@@ -117,16 +139,21 @@ bool settings_get_volume(float *out) {
 }
 
 bool settings_set_volume(float value) {
-    if (!g_audctl_ok)
-        return false;
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
-    s32 vmin = 0, vmax = 0;
-    if (R_FAILED(audctlGetTargetVolumeMin(&vmin)) ||
-        R_FAILED(audctlGetTargetVolumeMax(&vmax)) || vmax <= vmin)
+    if (R_FAILED(init_audctl()))
         return false;
+    s32 vmin = 0, vmax = 0;
+    Result rc1 = audctlGetTargetVolumeMin(&vmin);
+    Result rc2 = audctlGetTargetVolumeMax(&vmax);
+    if (R_FAILED(rc1) || R_FAILED(rc2) || vmax <= vmin) {
+        audctlExit();
+        return false;
+    }
     s32 vol = vmin + (s32)(value * (float)(vmax - vmin) + 0.5f);
-    return R_SUCCEEDED(audctlSetTargetVolume(VOLUME_TARGET, vol));
+    Result rc = audctlSetTargetVolume(VOLUME_TARGET, vol);
+    audctlExit();
+    return R_SUCCEEDED(rc);
 }
 
 // --- wireless / airplane mode -------------------------------------------------
@@ -139,13 +166,17 @@ bool settings_disable_wireless(void) {
 // --- battery ------------------------------------------------------------------
 
 bool settings_get_battery(uint32_t *out_percent, bool *out_charging) {
-    if (!g_psm_ok)
+    if (R_FAILED(init_psm()))
         return false;
     u32 pct = 0;
     PsmChargerType charger = PsmChargerType_Unconnected;
-    if (R_FAILED(psmGetBatteryChargePercentage(&pct)))
+    Result rc = psmGetBatteryChargePercentage(&pct);
+    if (R_SUCCEEDED(rc)) {
+        psmGetChargerType(&charger); // best-effort
+    }
+    psmExit();
+    if (R_FAILED(rc))
         return false;
-    psmGetChargerType(&charger); // best-effort
     *out_percent = pct;
     *out_charging = (charger != PsmChargerType_Unconnected);
     return true;
@@ -154,19 +185,23 @@ bool settings_get_battery(uint32_t *out_percent, bool *out_charging) {
 // --- automatic clock sync -----------------------------------------------------
 
 bool settings_get_auto_time(bool *out_enabled) {
-    if (!g_setsys_ok)
+    if (R_FAILED(init_setsys()))
         return false;
     bool en = false;
-    if (R_FAILED(setsysIsUserSystemClockAutomaticCorrectionEnabled(&en)))
+    Result rc = setsysIsUserSystemClockAutomaticCorrectionEnabled(&en);
+    setsysExit();
+    if (R_FAILED(rc))
         return false;
     *out_enabled = en;
     return true;
 }
 
 bool settings_set_auto_time(bool enabled) {
-    if (!g_setsys_ok)
+    if (R_FAILED(init_setsys()))
         return false;
-    return R_SUCCEEDED(setsysSetUserSystemClockAutomaticCorrectionEnabled(enabled));
+    Result rc = setsysSetUserSystemClockAutomaticCorrectionEnabled(enabled);
+    setsysExit();
+    return R_SUCCEEDED(rc);
 }
 
 // --- date / time / timezone ---------------------------------------------------

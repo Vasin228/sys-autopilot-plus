@@ -5,7 +5,9 @@
 #include "buttons.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #ifdef __SWITCH__
@@ -99,10 +101,39 @@ bool process_terminate(char *err, size_t err_sz) {
     if (reaped) {
         // Allow Horizon OS Application Manager to register termination and present
         // the modal "Software was closed" prompt, then dismiss it cleanly with 'A'.
-        svcSleepThread(1500000000ULL); // 1.5s for dialog animation & focus
+        // Double-tap handles timing jitter on slow microSD cards.
+        svcSleepThread(1200000000ULL); // 1.2s
+        input_tap(BTN_A, 200);
+        svcSleepThread(600000000ULL);  // 600ms
         input_tap(BTN_A, 200);
     }
     return true;
+}
+
+static u64 detect_override_title_id(void) {
+    FILE *f = fopen("sdmc:/atmosphere/config/override_config.ini", "r");
+    if (!f) return 0;
+    char line[256];
+    u64 found_tid = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == ';' || *p == '#' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+        if (strncasecmp(p, "title_id", 8) == 0 || strncasecmp(p, "program_id", 10) == 0) {
+            char *eq = strchr(p, '=');
+            if (eq) {
+                eq++;
+                while (*eq == ' ' || *eq == '\t') eq++;
+                u64 tid = strtoull(eq, NULL, 16);
+                if (tid != 0) {
+                    found_tid = tid;
+                    break;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return found_tid;
 }
 
 bool process_launch_title(u64 title_id, u64 *out_pid, char *err, size_t err_sz) {
@@ -146,18 +177,28 @@ bool process_launch_nro(const char *path, const char *args, u64 host_title_id, u
     fclose(f);
 
     mkdir("sdmc:/switch", 0777);
-    FILE *cfg = fopen("sdmc:/switch/hbmenu_nextload.cfg", "wb");
-    if (!cfg) {
-        if (err && err_sz > 0) snprintf(err, err_sz, "failed to create hbmenu_nextload.cfg");
-        return false;
+    static const char *const cfg_paths[] = {
+        "sdmc:/switch/hbmenu_nextload.cfg",
+        "sdmc:/hbmenu_nextload.cfg"
+    };
+    for (size_t i = 0; i < sizeof(cfg_paths) / sizeof(cfg_paths[0]); i++) {
+        FILE *cfg = fopen(cfg_paths[i], "wb");
+        if (cfg) {
+            if (args && args[0])
+                fprintf(cfg, "%s %s\n", fspath, args);
+            else
+                fprintf(cfg, "%s\n", fspath);
+            fclose(cfg);
+        }
     }
-    if (args && args[0])
-        fprintf(cfg, "%s %s\n", path, args);
-    else
-        fprintf(cfg, "%s\n", path);
-    fclose(cfg);
 
-    u64 tid = host_title_id ? host_title_id : 0x010000000000100DULL;
+    u64 tid = host_title_id;
+    if (!tid) {
+        tid = detect_override_title_id();
+    }
+    if (!tid) {
+        tid = 0x010000000000100DULL;
+    }
     return process_launch_title(tid, out_pid, err, err_sz);
 }
 

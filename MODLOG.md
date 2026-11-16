@@ -289,3 +289,18 @@ Key root causes identified:
   - All host tests (`./tests/run.sh`) passed.
   - Recompiled with devkitA64 (`make dist`): `exefs.nsp` (263,177 bytes, SHA256: `5236E9714F33F564E23224666F397DDD817449C493A1FDCCC7201F272A84D618`).
   - Packaged `sys-autopilot-plus-v1.5.3.zip` (419,400 bytes).
+
+### 15. Complete Service Decoupling & Enhanced NRO Launching (v1.5.3a-plus)
+- **Problem**:
+  1. Horizon OS services `lbl` (backlight), `audctl` (audio), `psm` (battery), and `setsys` (settings) were eagerly initialized at boot in `settings.c` and held open permanently. On heavily-modded CFW configurations with Tesla overlays (e.g. Fizeau, QuickNTP, Status-Monitor) and alternative launchers (Sphaira, uLaunch), these persistent handles risked secondary session exhaustion.
+  2. In `process.c`, NRO launching wrote relative paths to `hbmenu_nextload.cfg` rather than canonical filesystem URIs (`sdmc:/...`), and hardcoded Album applet (`0x010000000000100D`), causing memory constraint issues (applet mode ~400MB vs full 3.2GB application mode) when launching homebrew like Sphaira.
+- **Fix**:
+  1. Converted all Horizon services in `settings.c` (`lbl`, `audctl`, `psm`, `setsys`) to on-demand lazy acquisition with immediate exit (`init_*` -> work -> `*Exit()`). Sysmodule now maintains 0 idle sessions to all system settings services.
+  2. In `process.c`:
+     - Wrote canonical resolved filesystem path (`sdmc:/...`) to both `sdmc:/switch/hbmenu_nextload.cfg` and root `sdmc:/hbmenu_nextload.cfg`.
+     - Added automatic detection of Title Override host from `sdmc:/atmosphere/config/override_config.ini` (`title_id` / `program_id`) when `host_title_id` is omitted, avoiding forced applet memory limits.
+     - Added double-tap input sequence on `A` button with timing padding in `process_terminate()` to reliably dismiss modal closure dialogs across varied SD card speeds.
+- **Verification**:
+  - All host tests (`./tests/run.sh`) passed (100%).
+  - Recompiled with devkitA64 (`make dist`): `exefs.nsp` (263,369 bytes, SHA256: `DA3A4F92C92446006F5FA6DFA9FB25A73E4D90783D19A786AD3AA927C8F3D06A`).
+  - Packaged `sys-autopilot-plus-v1.5.3a.zip` (419,131 bytes).
