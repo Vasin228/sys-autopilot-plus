@@ -377,6 +377,38 @@ tools = [
             "clear": {"type": "boolean", "description": "If true, delete the crash report file after reading."}
         }},
     },
+    {
+        "name": "get_memory_layout",
+        "description": "Read the active game/application process memory map: PID, Title ID, Build ID, Main NSO base address & size, Heap base & size, and Alias region base & size.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "query_memory",
+        "description": "Inspect virtual memory mapping, size, and permissions (R/W/X) at the specified address in the active application.",
+        "inputSchema": {"type": "object", "properties": {
+            "address": {"type": "string", "description": "Address or offset to query (hex or decimal, e.g. '0x7100000000')."},
+            "base": {"type": "string", "enum": ["absolute", "main", "heap", "alias"], "description": "Base address reference. Default: 'absolute'."}
+        }, "required": ["address"]},
+    },
+    {
+        "name": "peek_memory",
+        "description": "Directly read bytes from the active application's virtual RAM (up to 1024 bytes). Supports absolute addresses, or offsets relative to 'main' NSO, 'heap', or 'alias' region.",
+        "inputSchema": {"type": "object", "properties": {
+            "address": {"type": "string", "description": "Address or offset to read from (hex or decimal, e.g. '0x7100000000' or '0x12345')."},
+            "size": {"type": "integer", "description": "Number of bytes to read (1..1024, default 4)."},
+            "base": {"type": "string", "enum": ["absolute", "main", "heap", "alias"], "description": "Base address reference. Default: 'absolute'."}
+        }, "required": ["address"]},
+    },
+    {
+        "name": "poke_memory",
+        "description": "Directly write bytes to the active application's virtual RAM. Supports hex data string or 32-bit integer value, with optional 'main' or 'heap' base offset.",
+        "inputSchema": {"type": "object", "properties": {
+            "address": {"type": "string", "description": "Address or offset to write to (hex or decimal)."},
+            "data": {"type": "string", "description": "Hex-encoded byte string to write (e.g. 'DEADBEEF')."},
+            "value": {"type": "integer", "description": "Optional 32-bit integer value to write (if 'data' omitted)."},
+            "base": {"type": "string", "enum": ["absolute", "main", "heap", "alias"], "description": "Base address reference. Default: 'absolute'."}
+        }, "required": ["address"]},
+    },
 ]
 
 payload = json.dumps({"tools": tools}, separators=(",", ":"))

@@ -15,6 +15,7 @@
 #include "process.h"
 #include "diagnostics.h"
 #include "telemetry.h"
+#include "memory.h"
 #include "server.h"
 
 #include <stdio.h>
@@ -741,6 +742,218 @@ static void handle_process_terminate(HttpRequest *req) {
     http_send_json(req->fd, 200, "{\"ok\":true}");
 }
 
+// --- /memory/* ----------------------------------------------------------------
+
+static void handle_memory_layout(HttpRequest *req) {
+    MemoryLayout layout;
+    char err[128] = {0};
+    if (!memory_get_layout(&layout, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to get memory layout");
+        return;
+    }
+    http_send_json(req->fd, 200,
+        "{\"ok\":true,\"running\":%s,\"pid\":%llu,\"titleId\":\"%016llX\","
+        "\"mainBase\":\"0x%llX\",\"mainSize\":%llu,"
+        "\"heapBase\":\"0x%llX\",\"heapSize\":%llu,"
+        "\"aliasBase\":\"0x%llX\",\"aliasSize\":%llu,"
+        "\"buildId\":\"%s\"}",
+        layout.running ? "true" : "false",
+        (unsigned long long)layout.pid,
+        (unsigned long long)layout.title_id,
+        (unsigned long long)layout.main_base,
+        (unsigned long long)layout.main_size,
+        (unsigned long long)layout.heap_base,
+        (unsigned long long)layout.heap_size,
+        (unsigned long long)layout.alias_base,
+        (unsigned long long)layout.alias_size,
+        layout.build_id);
+}
+
+static void handle_memory_query(HttpRequest *req) {
+    char addr_str[32] = {0}, base_str[32] = {0};
+
+    if (strcmp(req->method, "POST") == 0) {
+        static JsonDoc doc;
+        int root = read_json_body(req, &doc);
+        if (root < 0) return;
+        int t = json_obj_get(&doc, root, "address");
+        if (t < 0) t = json_obj_get(&doc, root, "offset");
+        if (t >= 0) {
+            if (!json_get_string(&doc, t, addr_str, sizeof(addr_str))) {
+                long long v = 0;
+                if (json_get_int(&doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
+            }
+        }
+        t = json_obj_get(&doc, root, "base");
+        if (t >= 0) json_get_string(&doc, t, base_str, sizeof(base_str));
+    } else {
+        http_query_get(req, "address", addr_str, sizeof(addr_str));
+        if (!addr_str[0]) http_query_get(req, "offset", addr_str, sizeof(addr_str));
+        http_query_get(req, "base", base_str, sizeof(base_str));
+    }
+
+    if (!addr_str[0]) {
+        http_send_error(req->fd, 400, "missing 'address'");
+        return;
+    }
+
+    uint64_t addr = strtoull(addr_str, NULL, 0);
+    MemoryBase base = memory_parse_base(base_str);
+
+    MemoryRegionInfo region;
+    char err[128] = {0};
+    if (!memory_query(addr, base, &region, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to query memory");
+        return;
+    }
+
+    http_send_json(req->fd, 200,
+        "{\"ok\":true,\"address\":\"0x%llX\",\"regionAddress\":\"0x%llX\",\"regionSize\":%llu,\"type\":%u,\"perm\":%u,\"readable\":%s,\"writable\":%s,\"executable\":%s}",
+        (unsigned long long)addr, (unsigned long long)region.base_address, (unsigned long long)region.size,
+        region.type, region.perm,
+        region.readable ? "true" : "false",
+        region.writable ? "true" : "false",
+        region.executable ? "true" : "false");
+}
+
+static void handle_memory_peek(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0) return;
+
+    char addr_str[32] = {0}, base_str[32] = {0};
+    int t = json_obj_get(&doc, root, "address");
+    if (t < 0) t = json_obj_get(&doc, root, "offset");
+    if (t < 0) {
+        http_send_error(req->fd, 400, "missing 'address'");
+        return;
+    }
+    if (!json_get_string(&doc, t, addr_str, sizeof(addr_str))) {
+        long long v = 0;
+        if (json_get_int(&doc, t, &v)) {
+            snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
+        }
+    }
+    uint64_t addr = strtoull(addr_str, NULL, 0);
+
+    size_t size = 4;
+    t = json_obj_get(&doc, root, "size");
+    if (t >= 0) {
+        long long s = 0;
+        if (json_get_int(&doc, t, &s) && s > 0) size = (size_t)s;
+    }
+    if (size > 4096) size = 4096;
+
+    t = json_obj_get(&doc, root, "base");
+    if (t >= 0) json_get_string(&doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    static uint8_t buf[4096];
+    uint64_t real_addr = 0;
+    char err[128] = {0};
+    if (!memory_read(addr, base, buf, size, &real_addr, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to read memory");
+        return;
+    }
+
+    size_t hex_count = size > 256 ? 256 : size;
+    static char hex_buf[513];
+    for (size_t i = 0; i < hex_count; i++) {
+        snprintf(hex_buf + i * 2, 3, "%02x", buf[i]);
+    }
+
+    uint32_t val32 = 0;
+    if (size >= 4) {
+        memcpy(&val32, buf, sizeof(val32));
+    }
+    uint64_t val64 = 0;
+    if (size >= 8) {
+        memcpy(&val64, buf, sizeof(val64));
+    }
+
+    http_send_json(req->fd, 200,
+        "{\"ok\":true,\"address\":\"0x%llX\",\"realAddress\":\"0x%llX\",\"size\":%zu,\"hex\":\"%s\",\"u32\":%u,\"u64\":\"0x%llX\"}",
+        (unsigned long long)addr, (unsigned long long)real_addr, size, hex_buf, val32, (unsigned long long)val64);
+}
+
+static void handle_memory_poke(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0) return;
+
+    char addr_str[32] = {0}, base_str[32] = {0}, data_str[1024] = {0};
+    int t = json_obj_get(&doc, root, "address");
+    if (t < 0) t = json_obj_get(&doc, root, "offset");
+    if (t < 0) {
+        http_send_error(req->fd, 400, "missing 'address'");
+        return;
+    }
+    if (!json_get_string(&doc, t, addr_str, sizeof(addr_str))) {
+        long long v = 0;
+        if (json_get_int(&doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
+    }
+    uint64_t addr = strtoull(addr_str, NULL, 0);
+
+    t = json_obj_get(&doc, root, "base");
+    if (t >= 0) json_get_string(&doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    static uint8_t buf[512];
+    size_t size = 0;
+
+    t = json_obj_get(&doc, root, "data");
+    if (t >= 0 && json_get_string(&doc, t, data_str, sizeof(data_str))) {
+        size_t len = strlen(data_str);
+        for (size_t i = 0; i + 1 < len && size < sizeof(buf); i += 2) {
+            char byte_str[3] = { data_str[i], data_str[i+1], '\0' };
+            buf[size++] = (uint8_t)strtoul(byte_str, NULL, 16);
+        }
+    } else {
+        t = json_obj_get(&doc, root, "value");
+        if (t >= 0) {
+            long long v = 0;
+            if (json_get_int(&doc, t, &v)) {
+                char type_str[16] = {0};
+                int tt = json_obj_get(&doc, root, "type");
+                if (tt >= 0) json_get_string(&doc, tt, type_str, sizeof(type_str));
+                if (strcasecmp(type_str, "u8") == 0) {
+                    uint8_t u = (uint8_t)v;
+                    memcpy(buf, &u, 1);
+                    size = 1;
+                } else if (strcasecmp(type_str, "u16") == 0) {
+                    uint16_t u = (uint16_t)v;
+                    memcpy(buf, &u, 2);
+                    size = 2;
+                } else if (strcasecmp(type_str, "u64") == 0) {
+                    uint64_t u = (uint64_t)v;
+                    memcpy(buf, &u, 8);
+                    size = 8;
+                } else {
+                    uint32_t u = (uint32_t)v;
+                    memcpy(buf, &u, 4);
+                    size = 4;
+                }
+            }
+        }
+    }
+
+    if (size == 0) {
+        http_send_error(req->fd, 400, "missing 'data' (hex) or 'value'");
+        return;
+    }
+
+    uint64_t real_addr = 0;
+    char err[128] = {0};
+    if (!memory_write(addr, base, buf, size, &real_addr, err, sizeof(err))) {
+        http_send_error(req->fd, 500, err[0] ? err : "failed to write memory");
+        return;
+    }
+
+    http_send_json(req->fd, 200,
+        "{\"ok\":true,\"address\":\"0x%llX\",\"realAddress\":\"0x%llX\",\"written\":%zu}",
+        (unsigned long long)addr, (unsigned long long)real_addr, size);
+}
+
 // --- /diagnostics/* -----------------------------------------------------------
 
 static void handle_diagnostics_crash(HttpRequest *req) {
@@ -820,6 +1033,13 @@ static const Route kRoutes[] = {
     { "POST",   "/process/launch-nro",handle_process_launch_nro },
     { "POST",   "/process/launch_nro",handle_process_launch_nro },
     { "POST",   "/process/terminate", handle_process_terminate },
+    { "GET",    "/memory/layout",     handle_memory_layout },
+    { "GET",    "/memory/query",      handle_memory_query },
+    { "POST",   "/memory/query",      handle_memory_query },
+    { "POST",   "/memory/peek",       handle_memory_peek },
+    { "POST",   "/memory/read",       handle_memory_peek },
+    { "POST",   "/memory/poke",       handle_memory_poke },
+    { "POST",   "/memory/write",      handle_memory_poke },
     { "GET",    "/diagnostics/crash", handle_diagnostics_crash },
     { "GET",    "/network/dns",       handle_dns_get },
     { "POST",   "/network/dns",       handle_dns_set },

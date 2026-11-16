@@ -49,7 +49,7 @@ cc $CFLAGS -Ifake \
     "$SRC/buttons.c" "$SRC/apiargs.c" "$SRC/files.c" "$SRC/power.c" \
     "$SRC/oauth.c" "$SRC/sha256.c" "$SRC/config.c" "$SRC/device_info.c" \
     "$SRC/settings.c" "$SRC/titles.c" "$SRC/network.c" \
-    "$SRC/process.c" "$SRC/diagnostics.c" "$SRC/telemetry.c"
+    "$SRC/process.c" "$SRC/diagnostics.c" "$SRC/telemetry.c" "$SRC/memory.c"
 "$OUT/test_mcp"
 
 # Release tooling: our resilient changelog generator (replaces the flaky

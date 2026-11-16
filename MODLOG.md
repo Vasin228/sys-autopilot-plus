@@ -304,3 +304,33 @@ Key root causes identified:
   - All host tests (`./tests/run.sh`) passed (100%).
   - Recompiled with devkitA64 (`make dist`): `exefs.nsp` (263,369 bytes, SHA256: `DA3A4F92C92446006F5FA6DFA9FB25A73E4D90783D19A786AD3AA927C8F3D06A`).
   - Packaged `sys-autopilot-plus-v1.5.3a.zip` (419,131 bytes).
+
+### 16. Direct Memory Inspection & Modification (Layout, Query, Peek, Poke)
+- **Feature Overview**:
+  - Implemented direct memory reading and writing (`peek` and `poke`) equivalent to `sys-botbase`, exposing modern REST endpoints and MCP tools for automation, memory inspection, and game botting.
+  - REST endpoints:
+    * `GET /memory/layout`: returns active application process PID, Title ID, Build ID (32-byte hex), Main NSO base & size, Heap base & size, and Alias base & size.
+    * `GET /memory/query` / `POST /memory/query`: queries virtual memory page/region base, size, type, and permissions (`readable`, `writable`, `executable`) at any virtual address.
+    * `POST /memory/peek` (alias `/memory/read`): reads raw bytes (up to 4096 bytes via REST, 1024 bytes via MCP) from target process virtual memory. Supports relative offsets (`main`, `heap`, `alias`) or absolute addresses.
+    * `POST /memory/poke` (alias `/memory/write`): writes raw bytes (hex data string or typed integer values `u8`, `u16`, `u32`, `u64`) to writable target process virtual memory.
+  - MCP Tools: `get_memory_layout`, `query_memory`, `peek_memory`, `poke_memory`.
+- **Implementation Details**:
+  - Switch implementation (`source/common/memory.c`):
+    * Retrieves active application PID via `pmdmntGetApplicationProcessId`.
+    * Module and Build ID via `ldr:dmnt` (`ldrDmntGetProcessModuleInfo`).
+    * Virtual region bases via `svcGetInfo` (`InfoType_HeapRegionAddress`, `InfoType_AliasRegionAddress`).
+    * Debug access via kernel syscalls `svcDebugActiveProcess`, `svcQueryDebugProcessMemory`, `svcReadDebugProcessMemory`, and `svcWriteDebugProcessMemory`.
+    * Debug handles are attached lazily and immediately detached with `svcCloseHandle` after each operation to prevent game execution stall or session leaks.
+  - Added full host-side mock RAM and unit tests in `tests/test_mcp.c`.
+- **Verification**:
+  - All host tests (`./tests/run.sh`) passed (100%).
+  - Built with devkitA64 (`make dist`):
+    * `exefs.nsp`: 271,226 bytes (SHA256: `41CF81EBBD33229AC00E34C46712F92EAC1E65CFA01BB0D8FFCED3178640B7D7`).
+    * `sys-autopilot.nro`: 526,533 bytes (SHA256: `93173F56EDD215D7627C9431C823AD53EF81BCA9AD16263ADF14C68A796E1B64`).
+  - Deployed to Nintendo Switch via OTA (`PUT /files`).
+  - Live console verification:
+    * `GET /memory/layout` cleanly returned layout (PID 139, Title ID `0100152000022000`, Main Base `0x5A99200000`, Build ID `D33817C0C763D8FAF97D9A6534C19DB231FF7271...`).
+    * `GET /memory/query?address=0x0&base=main`: returned `.text` RX region.
+    * `GET /memory/query?address=0x3000&base=main`: returned `.data` RW region (`perm: 3`, `writable: true`).
+    * `POST /memory/peek`: successfully read `.data` bytes (`0100000000000000`).
+    * `POST /memory/poke`: successfully wrote 4 bytes to `main + 0x3000`.

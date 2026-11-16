@@ -615,6 +615,26 @@ static void test_files_put_atomic(void) {
     printf("files put atomic ok\n");
 }
 
+static void test_memory_tools(void) {
+    const char *r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\","
+                           "\"params\":{\"name\":\"get_memory_layout\",\"arguments\":{}}}");
+    assert(strstr(r, "Application PID: 4660"));
+    assert(strstr(r, "Main NSO Base: 0x7100000000"));
+
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"query_memory\",\"arguments\":{\"address\":\"0x100\",\"base\":\"main\"}}}");
+    assert(strstr(r, "Permissions: RW-") || strstr(r, "Permissions:"));
+
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"poke_memory\",\"arguments\":{\"address\":\"0x100\",\"data\":\"DEADBEEF\",\"base\":\"main\"}}}");
+    assert(strstr(r, "Wrote 4 bytes"));
+
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"peek_memory\",\"arguments\":{\"address\":\"0x100\",\"size\":4,\"base\":\"main\"}}}");
+    assert(strstr(r, "HEX: DEADBEEF"));
+    printf("memory tools ok\n");
+}
+
 static Config g_cfg_for_oauth;
 
 int main(void) {
@@ -639,6 +659,7 @@ int main(void) {
     test_telemetry_tools();
     test_touch_screen();
     test_files_put_atomic();
+    test_memory_tools();
     printf("all mcp tests passed\n");
     return 0;
 }

@@ -16,6 +16,7 @@
 #include "diagnostics.h"
 #include "telemetry.h"
 #include "network.h"
+#include "memory.h"
 #include "log.h"
 #include "mcp_tools.h"
 
@@ -1104,6 +1105,182 @@ static void handle_initialize(HttpRequest *req, const char *id, const JsonDoc *d
     send_rpc_value(req->fd, id, "result", val, (size_t)n);
 }
 
+static void tool_get_memory_layout(HttpRequest *req, const char *id) {
+    MemoryLayout layout;
+    char err[128] = {0};
+    if (!memory_get_layout(&layout, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to get memory layout");
+        return;
+    }
+    char text[512];
+    snprintf(text, sizeof(text),
+             "Application PID: %llu (0x%llX)\n"
+             "Title ID: %016llX\n"
+             "Build ID: %s\n"
+             "Main NSO Base: 0x%llX (size %llu)\n"
+             "Heap Base:     0x%llX (size %llu)\n"
+             "Alias Base:    0x%llX (size %llu)",
+             (unsigned long long)layout.pid, (unsigned long long)layout.pid,
+             (unsigned long long)layout.title_id,
+             layout.build_id,
+             (unsigned long long)layout.main_base, (unsigned long long)layout.main_size,
+             (unsigned long long)layout.heap_base, (unsigned long long)layout.heap_size,
+             (unsigned long long)layout.alias_base, (unsigned long long)layout.alias_size);
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_query_memory(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char addr_str[32] = {0}, base_str[32] = {0};
+    int t = json_obj_get(doc, args, "address");
+    if (t < 0) t = json_obj_get(doc, args, "offset");
+    if (t < 0) {
+        send_tool_error(req->fd, id, "missing 'address'");
+        return;
+    }
+    if (!json_get_string(doc, t, addr_str, sizeof(addr_str))) {
+        long long v = 0;
+        if (json_get_int(doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
+    }
+    uint64_t addr = strtoull(addr_str, NULL, 0);
+
+    t = json_obj_get(doc, args, "base");
+    if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    MemoryRegionInfo region;
+    char err[128] = {0};
+    if (!memory_query(addr, base, &region, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to query memory");
+        return;
+    }
+
+    char text[256];
+    snprintf(text, sizeof(text),
+             "Memory region for 0x%llX:\n"
+             "Base: 0x%llX\n"
+             "Size: %llu bytes\n"
+             "Type: %u, Perm: %u\n"
+             "Permissions: %s%s%s",
+             (unsigned long long)addr,
+             (unsigned long long)region.base_address,
+             (unsigned long long)region.size,
+             region.type, region.perm,
+             region.readable ? "R" : "-",
+             region.writable ? "W" : "-",
+             region.executable ? "X" : "-");
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_peek_memory(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char addr_str[32] = {0}, base_str[32] = {0};
+    int t = json_obj_get(doc, args, "address");
+    if (t < 0) t = json_obj_get(doc, args, "offset");
+    if (t < 0) {
+        send_tool_error(req->fd, id, "missing 'address'");
+        return;
+    }
+    if (!json_get_string(doc, t, addr_str, sizeof(addr_str))) {
+        long long v = 0;
+        if (json_get_int(doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
+    }
+    uint64_t addr = strtoull(addr_str, NULL, 0);
+
+    size_t size = 4;
+    t = json_obj_get(doc, args, "size");
+    if (t >= 0) {
+        long long s = 0;
+        if (json_get_int(doc, t, &s) && s > 0) size = (size_t)s;
+    }
+    if (size > 1024) size = 1024;
+
+    t = json_obj_get(doc, args, "base");
+    if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    static uint8_t buf[1024];
+    uint64_t real_addr = 0;
+    char err[128] = {0};
+    if (!memory_read(addr, base, buf, size, &real_addr, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to read memory");
+        return;
+    }
+
+    char hex[257] = {0};
+    size_t hex_count = size > 128 ? 128 : size;
+    for (size_t i = 0; i < hex_count; i++) {
+        snprintf(hex + i * 2, 3, "%02X", buf[i]);
+    }
+
+    uint32_t val32 = 0;
+    if (size >= 4) memcpy(&val32, buf, 4);
+
+    char text[512];
+    snprintf(text, sizeof(text),
+             "Read %zu bytes at 0x%llX (real 0x%llX):\n"
+             "HEX: %s\n"
+             "u32: %u (0x%08X)",
+             size, (unsigned long long)addr, (unsigned long long)real_addr, hex, val32, val32);
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_poke_memory(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char addr_str[32] = {0}, base_str[32] = {0}, data_str[512] = {0};
+    int t = json_obj_get(doc, args, "address");
+    if (t < 0) t = json_obj_get(doc, args, "offset");
+    if (t < 0) {
+        send_tool_error(req->fd, id, "missing 'address'");
+        return;
+    }
+    if (!json_get_string(doc, t, addr_str, sizeof(addr_str))) {
+        long long v = 0;
+        if (json_get_int(doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
+    }
+    uint64_t addr = strtoull(addr_str, NULL, 0);
+
+    t = json_obj_get(doc, args, "base");
+    if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    static uint8_t buf[256];
+    size_t size = 0;
+
+    t = json_obj_get(doc, args, "data");
+    if (t >= 0 && json_get_string(doc, t, data_str, sizeof(data_str))) {
+        size_t len = strlen(data_str);
+        for (size_t i = 0; i + 1 < len && size < sizeof(buf); i += 2) {
+            char byte_str[3] = { data_str[i], data_str[i+1], '\0' };
+            buf[size++] = (uint8_t)strtoul(byte_str, NULL, 16);
+        }
+    } else {
+        t = json_obj_get(doc, args, "value");
+        if (t >= 0) {
+            long long v = 0;
+            if (json_get_int(doc, t, &v)) {
+                uint32_t u = (uint32_t)v;
+                memcpy(buf, &u, 4);
+                size = 4;
+            }
+        }
+    }
+
+    if (size == 0) {
+        send_tool_error(req->fd, id, "missing 'data' (hex) or 'value'");
+        return;
+    }
+
+    uint64_t real_addr = 0;
+    char err[128] = {0};
+    if (!memory_write(addr, base, buf, size, &real_addr, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "failed to write memory");
+        return;
+    }
+
+    char text[256];
+    snprintf(text, sizeof(text), "Wrote %zu bytes to 0x%llX (real 0x%llX)",
+             size, (unsigned long long)addr, (unsigned long long)real_addr);
+    send_tool_ok(req->fd, id, text);
+}
+
 static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *doc,
                               int params, bool content_streamed) {
     char name[40] = "";
@@ -1169,6 +1346,10 @@ static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *d
     else if (strcmp(name, "terminate_process") == 0)     tool_terminate_process(req, id);
     else if (strcmp(name, "get_last_crash_report") == 0) tool_get_last_crash_report(req, id, doc, args);
     else if (strcmp(name, "get_telemetry") == 0)         tool_get_telemetry(req, id);
+    else if (strcmp(name, "get_memory_layout") == 0)     tool_get_memory_layout(req, id);
+    else if (strcmp(name, "query_memory") == 0)          tool_query_memory(req, id, doc, args);
+    else if (strcmp(name, "peek_memory") == 0)           tool_peek_memory(req, id, doc, args);
+    else if (strcmp(name, "poke_memory") == 0)           tool_poke_memory(req, id, doc, args);
     else send_rpc_error(req->fd, id, -32602, "unknown tool");
 }
 
