@@ -1,5 +1,16 @@
 # sys-autopilot
 
+## 1.6.0
+
+### Minor Changes
+
+- **Direct Memory Access (Layout, Query, Peek & Poke)**: Full virtual RAM reading and writing interface for active games and homebrew applications (sys-botbase feature parity with modern REST and MCP):
+  - `GET /memory/layout` (MCP: `get_memory_layout`): Retrieves active application PID, Title ID, 32-byte Build ID, and virtual base addresses & sizes for Main NSO (`main`), dynamic heap (`heap`), and alias region (`alias`) via `pm:dmnt`, `ldr:dmnt`, and `svcGetInfo`.
+  - `GET /memory/query` / `POST /memory/query` (MCP: `query_memory`): Inspects page memory mapping, size, memory type, and access permissions (`readable`, `writable`, `executable`) at any virtual address via `svcQueryDebugProcessMemory`.
+  - `POST /memory/peek` (MCP: `peek_memory`): Directly reads raw memory bytes (up to 4096 bytes via REST, 1024 bytes via MCP) from target process virtual memory via `svcReadDebugProcessMemory`. Decodes hex dump, `u32`, and `u64` values.
+  - `POST /memory/poke` (MCP: `poke_memory`): Directly writes raw bytes (hex string or typed integers `u8`, `u16`, `u32`, `u64`) into writable virtual memory of the active game via `svcWriteDebugProcessMemory`.
+  - **Zero-Stall Lazy Debug Lifecycle**: Connects to the target process lazily on each request and immediately detaches via `svcCloseHandle` without leaving open debug handles, stalling game frames, or causing session exhaustion.
+
 ## 1.5.0
 
 ### Minor Changes

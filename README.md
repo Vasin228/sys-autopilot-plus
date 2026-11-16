@@ -8,6 +8,7 @@ the Switch while testing homebrew applications and commercial titles.
 
 ## What's New in sys-autopilot-plus
 
+- 🧠 **Direct Process Memory Access (`/memory/*`, tools `get_memory_layout`, `query_memory`, `peek_memory`, `poke_memory`)**: Real-time virtual RAM inspection and modification for active games and homebrew applications (sys-botbase feature parity with modern REST and native MCP). Safely reads and writes memory via Horizon OS kernel syscalls (`svcReadDebugProcessMemory`, `svcWriteDebugProcessMemory`, `svcQueryDebugProcessMemory`) and `ldr:dmnt` with lazy attach/detach and zero handle leakage. Supports relative offsets (`main` NSO, `heap`, `alias`) and absolute addresses.
 - 🎥 **Live MJPEG Video Stream (`GET /stream`)**: Real-time video streaming directly to any browser, media player, or vision pipeline via `multipart/x-mixed-replace` with configurable FPS.
 - 📊 **Hardware & System Telemetry (`GET /telemetry`, tool `get_telemetry`)**: Live CPU, GPU, and EMC clock frequencies, SoC and PCB temperatures, battery metrics, active foreground Process ID / Title ID, and frame swap counters.
 - 🎮 **Self-Healing Virtual Controller**: Transparent recovery from Horizon OS HDLS device handle invalidation (`0x1c24ca`) when launching or switching titles. Input delivery remains 100% reliable across application boundaries.
@@ -219,6 +220,10 @@ Details:
 | `terminate_process` | Gracefully terminate foreground title and wait for memory pool release |
 | `get_telemetry` | Real-time hardware telemetry: CPU/GPU/EMC clocks, SoC/battery temperatures, battery %, foreground process/title ID, display frame stats |
 | `get_last_crash_report` | Fetch and inspect the latest fatal crash report from Atmosphère |
+| `get_memory_layout` | Active process memory map: PID, Title ID, 32-byte Build ID, Main NSO, Heap, and Alias bases & sizes |
+| `query_memory` | Query virtual memory mapping, size, and permissions (`readable`, `writable`, `executable`) at any virtual address |
+| `peek_memory` | Read raw memory bytes from active application (hex string and u32/u64 decoded, up to 1024 bytes) |
+| `poke_memory` | Write raw bytes (hex string or u8..u64 integer) to writable active application RAM |
 
 Button names: `A B X Y L R ZL ZR PLUS MINUS UP DOWN LEFT RIGHT LSTICK RSTICK
 HOME CAPTURE` (aliases: `START`, `SELECT`, `DUP/DDOWN/DLEFT/DRIGHT`).
@@ -555,6 +560,49 @@ If no crash dump is present:
 {
   "found": false
 }
+```
+
+### Direct Memory Access (Layout, Query, Peek & Poke)
+
+Directly inspect and modify active application virtual RAM memory (feature parity with `sys-botbase`). Ideal for automation bots, real-time memory viewing, game state observation, and trainers:
+
+```
+GET  /memory/layout                      Active process PID, Title ID, Build ID, Main, Heap, Alias bases
+GET  /memory/query?address=...[&base=...] Query region mapping, size, and permissions (R/W/X)
+POST /memory/peek                        Read raw memory bytes (hex and u32/u64 decoded)
+POST /memory/poke                        Write raw memory bytes (hex string or u8..u64 integer)
+```
+
+Supported `base` references:
+- `main`: Relative to Main NSO base address (code/data).
+- `heap`: Relative to process Heap base address.
+- `alias`: Relative to process Alias region base address.
+- `absolute` (default): Absolute 64-bit virtual address.
+
+```sh
+# 1. Fetch memory layout of active game
+curl http://<ip>:4150/memory/layout
+# -> {"ok":true,"running":true,"pid":139,"titleId":"0100152000022000","mainBase":"0x5A99200000",
+#     "mainSize":16384,"heapBase":"0x5F9000000","heapSize":8589934592,"aliasBase":"0x4981400000",
+#     "aliasSize":68719476736,"buildId":"D33817C0C763D8FAF97D9A6534C19DB231FF7271000000000000000000000000"}
+
+# 2. Query permissions for an address
+curl "http://<ip>:4150/memory/query?address=0x3000&base=main"
+# -> {"ok":true,"address":"0x3000","regionAddress":"0x5A99203000","regionSize":4096,"type":4,"perm":3,
+#     "readable":true,"writable":true,"executable":false}
+
+# 3. Read (peek) memory
+curl -X POST http://<ip>:4150/memory/peek \
+     -H 'Content-Type: application/json' \
+     -d '{"address":"0x0","base":"main","size":16}'
+# -> {"ok":true,"address":"0x0","realAddress":"0x5A99200000","size":16,
+#     "hex":"20000014f0000000484f4d4542524557","u32":335544352,"u64":"0xF014000020"}
+
+# 4. Write (poke) memory
+curl -X POST http://<ip>:4150/memory/poke \
+     -H 'Content-Type: application/json' \
+     -d '{"address":"0x3000","base":"main","data":"DEADBEEF"}'
+# -> {"ok":true,"address":"0x3000","realAddress":"0x5A99203000","written":4}
 ```
 
 ## Dev flavor (.nro)
