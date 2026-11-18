@@ -1,5 +1,17 @@
 # sys-autopilot
 
+## 1.6.1
+
+### Patch Changes
+
+- **Hard Freeze & Core 3 CPU Starvation Prevention**:
+  - Fixed infinite 0ms spin loop in `server.c`: added explicit health checks for `POLLERR`, `POLLHUP`, and `POLLNVAL` on listener and mDNS descriptors with automatic socket teardown and cooperative delay.
+  - Added 50ms yield and listener rebuild on fatal `accept()` socket errors (`EMFILE`, `ENFILE`, `EBADF`, `EINVAL`) to prevent CPU starvation when connections fail.
+  - Added mandatory 2ms cooperative yield in main server loop to guarantee Horizon OS Core 3 scheduler fair timesharing across all system services.
+  - Fixed premature sleep/wake resumption: `ReadyAwakenCritical` is now treated as internal pre-wake phase; network stack only resumes on `ReadyAwaken` and `Awake` with 300ms settling grace period.
+  - Increased `num_bsd_sessions` from 4 to 8 to prevent socket table exhaustion under concurrent network traffic.
+  - Added safe on-demand `psm` session wrapping for battery charge fields query.
+
 ## 1.6.0
 
 ### Minor Changes
