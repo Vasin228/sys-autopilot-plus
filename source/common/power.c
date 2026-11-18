@@ -87,11 +87,15 @@ PowerEvent power_poll(void) {
         case PscPmState_ReadySleepCritical:
         case PscPmState_ReadyShutdown:
             return PowerEvent_Sleep;
-        case PscPmState_ReadyAwaken:
         case PscPmState_ReadyAwakenCritical:
+            // Critical services waking phase: acknowledge to OS but stay suspended.
+            pscPmModuleAcknowledge(&g_module, g_pending_state);
+            return PowerEvent_None;
+        case PscPmState_ReadyAwaken:
         case PscPmState_Awake:
-        default:
             return PowerEvent_Wake;
+        default:
+            return PowerEvent_None;
     }
 }
 

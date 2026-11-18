@@ -67,12 +67,17 @@ static void read_battery_info(TelemetryStats *stats) {
 
     settings_get_battery(&stats->battery_percent, &stats->battery_charging);
 
-    PsmBatteryChargeInfoFields fields;
-    memset(&fields, 0, sizeof(fields));
-    if (R_SUCCEEDED(psmGetBatteryChargeInfoFields(&fields))) {
-        stats->battery_temp_c = (int32_t)(fields.temperature_celcius / 1000);
-        stats->battery_volt_mv = fields.battery_charge_milli_voltage;
+    smInitialize();
+    if (R_SUCCEEDED(psmInitialize())) {
+        PsmBatteryChargeInfoFields fields;
+        memset(&fields, 0, sizeof(fields));
+        if (R_SUCCEEDED(psmGetBatteryChargeInfoFields(&fields))) {
+            stats->battery_temp_c = (int32_t)(fields.temperature_celcius / 1000);
+            stats->battery_volt_mv = fields.battery_charge_milli_voltage;
+        }
+        psmExit();
     }
+    smExit();
 }
 
 static void read_timeshift_stats(TelemetryStats *stats) {

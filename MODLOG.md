@@ -334,3 +334,29 @@ Key root causes identified:
     * `GET /memory/query?address=0x3000&base=main`: returned `.data` RW region (`perm: 3`, `writable: true`).
     * `POST /memory/peek`: successfully read `.data` bytes (`0100000000000000`).
     * `POST /memory/poke`: successfully wrote 4 bytes to `main + 0x3000`.
+
+### 17. Hard Freeze & CPU Starvation Prevention (v1.6.1-plus)
+- **Problem**:
+  - Console experienced sudden, complete hard freezes during gameplay or sleep/wake transitions with no Atmosphère crash reports generated.
+  - Root causes identified:
+    1. **Unchecked Socket Error Busy Loop**: In `server.c`, `poll()` checked only `POLLIN`. If `listen_fd` or `mdns_fd` encountered `POLLERR`, `POLLHUP`, or `POLLNVAL` (e.g. Wi-Fi reconnection, DHCP renewal, network interface drop), `poll()` returned immediately with `revents` without sleeping. The loop executed `continue;` with 0ms sleep, pinning Core 3 at 100% CPU at priority 44 and starving Horizon OS system services.
+    2. **`accept()` Spin on Failure**: If `accept()` failed with `EMFILE`, `ENFILE`, `EBADF`, or `EINVAL`, the loop continued without yielding, repeatedly triggering `poll()` on the unserviced backlog.
+    3. **Premature Power Wake**: `power.c` treated `ReadyAwakenCritical` as awake, causing `server.c` to prematurely invoke `nifm` and `bsd:s` while hardware power rails and network drivers were still in transition.
+    4. **Limited Socket Sessions**: `num_bsd_sessions` was set to 4, risking `EMFILE` under overlapping connections.
+- **Fix**:
+  - In `source/common/server.c`:
+    * Added explicit `POLLERR | POLLHUP | POLLNVAL` health checks for `listen_fd` and `mdns_fd` with socket teardown and 50ms yield.
+    * Added 50ms yield and listener rebuild on fatal `accept()` errors (`EMFILE`, `ENFILE`, `EBADF`, `EINVAL`).
+    * Added mandatory 2ms cooperative yield (`svcSleepThread(2000000LL)`) after handling connections and spurious poll returns to ensure Core 3 scheduler fair timesharing.
+  - In `source/common/power.c`:
+    * Handled `ReadyAwakenCritical` as internal pre-wake phase (acknowledged without waking sockets); wake only triggers on `ReadyAwaken` and `Awake` with 300ms settling delay.
+  - In `source/main.c`:
+    * Increased `kSocketConfig.num_bsd_sessions` from 4 to 8.
+  - In `source/common/telemetry.c`:
+    * Safely wrapped battery charge fields query in on-demand `psm` session.
+- **Verification**:
+  - Host unit tests (`tests/run.sh`) passed 100%.
+  - Recompiled with devkitA64 (`make dist`):
+    * `exefs.nsp`: 271,452 bytes (SHA256: `27A5E63D6B24D444D0F8E71AC1EE77D8322065CD7484551731F497E9F9CA6F35`).
+    * `sys-autopilot.nro`: 526,533 bytes (SHA256: `DFB4A109E5203F4614176FB064332C74AFE0C3EEBA9B3E8A1F32F6081530BA10`).
+  - Deployed binaries to live console via OTA (`PUT /files`).

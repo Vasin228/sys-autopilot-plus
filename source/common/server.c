@@ -247,6 +247,8 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
         } else if (pe == PowerEvent_Wake) {
             power_ack();
             suspended = false;
+            // Allow network hardware and nifm to fully settle before opening sockets.
+            svcSleepThread(300000000LL); // 300ms
             // Safe to touch the SD card again now that we are awake.
             log_set_suspended(false);
             LOGF("server: power: awake\n");
@@ -387,17 +389,48 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
             continue;
 
         // Service mDNS queries before HTTP accepts.
-        if (mdns_idx >= 0 && (pfds[mdns_idx].revents & POLLIN))
-            mdns_handle_readable(mdns_fd, &mdns_cfg);
+        if (mdns_idx >= 0) {
+            if (pfds[mdns_idx].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                LOGF("server: mdns socket error revents=0x%x, rebuilding mdns\n",
+                     pfds[mdns_idx].revents);
+                mdns_close(mdns_fd);
+                mdns_fd = -1;
+                mdns_ready = false;
+            } else if (pfds[mdns_idx].revents & POLLIN) {
+                mdns_handle_readable(mdns_fd, &mdns_cfg);
+            }
+        }
 
-        if (!(pfds[0].revents & POLLIN))
+        // Check listener socket health.
+        if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            LOGF("server: listener error revents=0x%x, rebuilding listener\n",
+                 pfds[0].revents);
+            server_stop_stream();
+            close(listen_fd);
+            listen_fd = -1;
+            svcSleepThread(50000000LL); // 50ms yield
             continue;
+        }
+
+        if (!(pfds[0].revents & POLLIN)) {
+            // No incoming connection; yield briefly to prevent busy spinning on Core 3.
+            svcSleepThread(2000000LL); // 2ms
+            continue;
+        }
 
         int client = accept(listen_fd, NULL, NULL);
         if (client < 0) {
-            // EAGAIN: spurious wakeup on the non-blocking listener.
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
-                LOGF("server: accept failed (errno=%d)\n", errno);
+            // EAGAIN / EWOULDBLOCK: spurious wakeup on the non-blocking listener.
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                svcSleepThread(2000000LL); // 2ms yield
+                continue;
+            }
+            LOGF("server: accept failed (errno=%d)\n", errno);
+            svcSleepThread(50000000LL); // 50ms yield to prevent tight spin on EMFILE/ECONNABORTED
+            if (errno == EMFILE || errno == ENFILE || errno == EBADF || errno == EINVAL) {
+                close(listen_fd);
+                listen_fd = -1;
+            }
             continue;
         }
 
@@ -408,6 +441,10 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
             shutdown(client, SHUT_WR);
             close(client);
         }
+
+        // Cooperative yield after request processing: ensure Horizon OS Core 3
+        // scheduler gives timeslices to system services and other sysmodules.
+        svcSleepThread(2000000LL); // 2ms
 
         // Agent-requested power action: executed only after the response has
         // been sent and the connection closed, so the client gets its

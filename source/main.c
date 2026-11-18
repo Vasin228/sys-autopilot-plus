@@ -47,10 +47,9 @@ static const SocketInitConfig kSocketConfig = {
     .udp_tx_buf_size     = 0x2400,
     .udp_rx_buf_size     = 0xA500,
     .sb_efficiency       = 2,
-    // Sessions in concurrent use: the TCP listener, one accepted client, and
-    // the persistent mDNS/DNS-SD UDP socket. 3 is the minimum; use 4 for a
-    // little headroom.
-    .num_bsd_sessions    = 4,
+    // Sessions in concurrent use: listener, accepted client, mDNS UDP socket,
+    // plus stream and extra concurrent socket headroom.
+    .num_bsd_sessions    = 8,
     // Sysmodules in pool_partition 2 need bsd:s (system socket service).
     // BsdServiceType_Auto tries bsd:s first, then falls back to bsd:u.
     .bsd_service_type    = BsdServiceType_Auto,
