@@ -18,6 +18,8 @@
 #include "memory.h"
 #include "server.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -293,28 +295,33 @@ static void handle_settings_theme(HttpRequest *req) {
 
 static void handle_settings_nickname(HttpRequest *req) {
     if (strcmp(req->method, "GET") == 0) {
-        char name[128] = {0};
+        char name[128] = {0}, esc[256] = {0};
         if (!settings_get_nickname(name, sizeof(name))) {
             http_send_error(req->fd, 500, "failed to read nickname");
             return;
         }
-        http_send_json(req->fd, 200, "{\"nickname\":\"%s\"}", name);
+        if (json_escape(name, strlen(name), esc, sizeof(esc)) == (size_t)-1)
+            snprintf(esc, sizeof(esc), "%s", name);
+        http_send_json(req->fd, 200, "{\"nickname\":\"%s\"}", esc);
         return;
     }
     static JsonDoc doc;
     int root = read_json_body(req, &doc);
     if (root < 0)
         return;
-    char name[128] = {0};
+    char name[128] = {0}, esc[256] = {0};
     int t = json_obj_get(&doc, root, "nickname");
     if (t < 0 || !json_get_string(&doc, t, name, sizeof(name)) || name[0] == '\0') {
         http_send_error(req->fd, 400, "missing non-empty 'nickname'");
         return;
     }
-    if (!settings_set_nickname(name))
+    if (!settings_set_nickname(name)) {
         http_send_error(req->fd, 500, "failed to set nickname");
-    else
-        http_send_json(req->fd, 200, "{\"ok\":true,\"nickname\":\"%s\"}", name);
+    } else {
+        if (json_escape(name, strlen(name), esc, sizeof(esc)) == (size_t)-1)
+            snprintf(esc, sizeof(esc), "%s", name);
+        http_send_json(req->fd, 200, "{\"ok\":true,\"nickname\":\"%s\"}", esc);
+    }
 }
 
 // Shared get/set for the two normalized 0..1 float settings.
@@ -729,8 +736,11 @@ static void handle_process_launch_nro(HttpRequest *req) {
         http_send_error(req->fd, 500, err[0] ? err : "failed to launch NRO");
         return;
     }
+    char esc_path[512];
+    if (json_escape(path, strlen(path), esc_path, sizeof(esc_path)) == (size_t)-1)
+        snprintf(esc_path, sizeof(esc_path), "%s", path);
     http_send_json(req->fd, 200, "{\"ok\":true,\"pid\":%llu,\"path\":\"%s\"}",
-                   (unsigned long long)pid, path);
+                   (unsigned long long)pid, esc_path);
 }
 
 static void handle_process_terminate(HttpRequest *req) {
@@ -744,15 +754,75 @@ static void handle_process_terminate(HttpRequest *req) {
 
 // --- /memory/* ----------------------------------------------------------------
 
+static int mem_err_status(const char *err) {
+    return (err && strstr(err, "no running application")) ? 409 : 500;
+}
+
+static bool parse_u64_strict(const char *s, uint64_t *out) {
+    if (!s || !s[0]) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-' || *s == '\0') return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno == ERANGE || end == s) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+static bool parse_i64_strict(const char *s, int64_t *out) {
+    if (!s || !s[0]) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return false;
+    errno = 0;
+    char *end = NULL;
+    long long v = strtoll(s, &end, 0);
+    if (errno == ERANGE || end == s) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    *out = (int64_t)v;
+    return true;
+}
+
+static bool parse_hex_strict(const char *hex, uint8_t *out, size_t cap, size_t *out_len) {
+    if (!hex) return false;
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+    size_t len = strlen(hex);
+    if (len == 0 || (len & 1) != 0 || len / 2 > cap) return false;
+    for (size_t i = 0; i < len; i += 2) {
+        if (!isxdigit((unsigned char)hex[i]) || !isxdigit((unsigned char)hex[i + 1]))
+            return false;
+        char b[3] = { hex[i], hex[i + 1], '\0' };
+        out[i / 2] = (uint8_t)strtoul(b, NULL, 16);
+    }
+    *out_len = len / 2;
+    return true;
+}
+
+static size_t encode_typed_value(long long v, const char *type_str, uint8_t *buf) {
+    if (type_str && strcasecmp(type_str, "u8") == 0) {
+        uint8_t u = (uint8_t)v; memcpy(buf, &u, 1); return 1;
+    } else if (type_str && strcasecmp(type_str, "u16") == 0) {
+        uint16_t u = (uint16_t)v; memcpy(buf, &u, 2); return 2;
+    } else if (type_str && strcasecmp(type_str, "u64") == 0) {
+        uint64_t u = (uint64_t)v; memcpy(buf, &u, 8); return 8;
+    }
+    uint32_t u = (uint32_t)v; memcpy(buf, &u, 4); return 4;
+}
+
 static void handle_memory_layout(HttpRequest *req) {
     MemoryLayout layout;
     char err[128] = {0};
     if (!memory_get_layout(&layout, err, sizeof(err))) {
-        http_send_error(req->fd, 500, err[0] ? err : "failed to get memory layout");
+        http_send_error(req->fd, mem_err_status(err), err[0] ? err : "failed to get memory layout");
         return;
     }
     http_send_json(req->fd, 200,
         "{\"ok\":true,\"running\":%s,\"pid\":%llu,\"titleId\":\"%016llX\","
+        "\"moduleCount\":%u,"
+        "\"rtldBase\":\"0x%llX\",\"rtldSize\":%llu,"
         "\"mainBase\":\"0x%llX\",\"mainSize\":%llu,"
         "\"heapBase\":\"0x%llX\",\"heapSize\":%llu,"
         "\"aliasBase\":\"0x%llX\",\"aliasSize\":%llu,"
@@ -760,6 +830,9 @@ static void handle_memory_layout(HttpRequest *req) {
         layout.running ? "true" : "false",
         (unsigned long long)layout.pid,
         (unsigned long long)layout.title_id,
+        layout.module_count,
+        (unsigned long long)layout.rtld_base,
+        (unsigned long long)layout.rtld_size,
         (unsigned long long)layout.main_base,
         (unsigned long long)layout.main_size,
         (unsigned long long)layout.heap_base,
@@ -792,18 +865,18 @@ static void handle_memory_query(HttpRequest *req) {
         http_query_get(req, "base", base_str, sizeof(base_str));
     }
 
-    if (!addr_str[0]) {
-        http_send_error(req->fd, 400, "missing 'address'");
+    uint64_t addr = 0;
+    if (!parse_u64_strict(addr_str, &addr)) {
+        http_send_error(req->fd, 400, "missing or invalid 'address'");
         return;
     }
 
-    uint64_t addr = strtoull(addr_str, NULL, 0);
     MemoryBase base = memory_parse_base(base_str);
 
     MemoryRegionInfo region;
     char err[128] = {0};
     if (!memory_query(addr, base, &region, err, sizeof(err))) {
-        http_send_error(req->fd, 500, err[0] ? err : "failed to query memory");
+        http_send_error(req->fd, mem_err_status(err), err[0] ? err : "failed to query memory");
         return;
     }
 
@@ -834,7 +907,11 @@ static void handle_memory_peek(HttpRequest *req) {
             snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
         }
     }
-    uint64_t addr = strtoull(addr_str, NULL, 0);
+    uint64_t addr = 0;
+    if (!parse_u64_strict(addr_str, &addr)) {
+        http_send_error(req->fd, 400, "invalid 'address'");
+        return;
+    }
 
     size_t size = 4;
     t = json_obj_get(&doc, root, "size");
@@ -852,28 +929,31 @@ static void handle_memory_peek(HttpRequest *req) {
     uint64_t real_addr = 0;
     char err[128] = {0};
     if (!memory_read(addr, base, buf, size, &real_addr, err, sizeof(err))) {
-        http_send_error(req->fd, 500, err[0] ? err : "failed to read memory");
+        http_send_error(req->fd, mem_err_status(err), err[0] ? err : "failed to read memory");
         return;
     }
 
-    size_t hex_count = size > 256 ? 256 : size;
-    static char hex_buf[513];
-    for (size_t i = 0; i < hex_count; i++) {
-        snprintf(hex_buf + i * 2, 3, "%02x", buf[i]);
+    static char hex_buf[8193];
+    static const char hx[] = "0123456789abcdef";
+    for (size_t i = 0; i < size; i++) {
+        hex_buf[i * 2]     = hx[buf[i] >> 4];
+        hex_buf[i * 2 + 1] = hx[buf[i] & 0xF];
     }
+    hex_buf[size * 2] = '\0';
 
     uint32_t val32 = 0;
-    if (size >= 4) {
-        memcpy(&val32, buf, sizeof(val32));
-    }
+    if (size >= 4) memcpy(&val32, buf, sizeof(val32));
     uint64_t val64 = 0;
-    if (size >= 8) {
-        memcpy(&val64, buf, sizeof(val64));
-    }
+    if (size >= 8) memcpy(&val64, buf, sizeof(val64));
 
-    http_send_json(req->fd, 200,
+    static char resp[8448];
+    int n = snprintf(resp, sizeof(resp),
         "{\"ok\":true,\"address\":\"0x%llX\",\"realAddress\":\"0x%llX\",\"size\":%zu,\"hex\":\"%s\",\"u32\":%u,\"u64\":\"0x%llX\"}",
         (unsigned long long)addr, (unsigned long long)real_addr, size, hex_buf, val32, (unsigned long long)val64);
+    if (n > 0 && (size_t)n < sizeof(resp))
+        http_send_response(req->fd, 200, "application/json", resp, (size_t)n);
+    else
+        http_send_error(req->fd, 500, "response too large");
 }
 
 static void handle_memory_poke(HttpRequest *req) {
@@ -892,7 +972,11 @@ static void handle_memory_poke(HttpRequest *req) {
         long long v = 0;
         if (json_get_int(&doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
     }
-    uint64_t addr = strtoull(addr_str, NULL, 0);
+    uint64_t addr = 0;
+    if (!parse_u64_strict(addr_str, &addr)) {
+        http_send_error(req->fd, 400, "invalid 'address'");
+        return;
+    }
 
     t = json_obj_get(&doc, root, "base");
     if (t >= 0) json_get_string(&doc, t, base_str, sizeof(base_str));
@@ -903,10 +987,9 @@ static void handle_memory_poke(HttpRequest *req) {
 
     t = json_obj_get(&doc, root, "data");
     if (t >= 0 && json_get_string(&doc, t, data_str, sizeof(data_str))) {
-        size_t len = strlen(data_str);
-        for (size_t i = 0; i + 1 < len && size < sizeof(buf); i += 2) {
-            char byte_str[3] = { data_str[i], data_str[i+1], '\0' };
-            buf[size++] = (uint8_t)strtoul(byte_str, NULL, 16);
+        if (!parse_hex_strict(data_str, buf, sizeof(buf), &size)) {
+            http_send_error(req->fd, 400, "invalid hex 'data' (must be even-length hex string)");
+            return;
         }
     } else {
         t = json_obj_get(&doc, root, "value");
@@ -916,23 +999,7 @@ static void handle_memory_poke(HttpRequest *req) {
                 char type_str[16] = {0};
                 int tt = json_obj_get(&doc, root, "type");
                 if (tt >= 0) json_get_string(&doc, tt, type_str, sizeof(type_str));
-                if (strcasecmp(type_str, "u8") == 0) {
-                    uint8_t u = (uint8_t)v;
-                    memcpy(buf, &u, 1);
-                    size = 1;
-                } else if (strcasecmp(type_str, "u16") == 0) {
-                    uint16_t u = (uint16_t)v;
-                    memcpy(buf, &u, 2);
-                    size = 2;
-                } else if (strcasecmp(type_str, "u64") == 0) {
-                    uint64_t u = (uint64_t)v;
-                    memcpy(buf, &u, 8);
-                    size = 8;
-                } else {
-                    uint32_t u = (uint32_t)v;
-                    memcpy(buf, &u, 4);
-                    size = 4;
-                }
+                size = encode_typed_value(v, type_str, buf);
             }
         }
     }
@@ -945,13 +1012,205 @@ static void handle_memory_poke(HttpRequest *req) {
     uint64_t real_addr = 0;
     char err[128] = {0};
     if (!memory_write(addr, base, buf, size, &real_addr, err, sizeof(err))) {
-        http_send_error(req->fd, 500, err[0] ? err : "failed to write memory");
+        http_send_error(req->fd, mem_err_status(err), err[0] ? err : "failed to write memory");
         return;
     }
 
     http_send_json(req->fd, 200,
         "{\"ok\":true,\"address\":\"0x%llX\",\"realAddress\":\"0x%llX\",\"written\":%zu}",
         (unsigned long long)addr, (unsigned long long)real_addr, size);
+}
+
+static void handle_memory_pointer(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0) return;
+
+    char base_str[32] = "main";
+    int t = json_obj_get(&doc, root, "base");
+    if (t >= 0) json_get_string(&doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    int arr = json_obj_get(&doc, root, "offsets");
+    if (arr < 0 || doc.tok[arr].type != JSMN_ARRAY) {
+        http_send_error(req->fd, 400, "missing 'offsets' array");
+        return;
+    }
+    int n_off = doc.tok[arr].size;
+    if (n_off <= 0 || n_off > 16) {
+        http_send_error(req->fd, 400, "'offsets' must have 1..16 elements");
+        return;
+    }
+
+    int64_t offsets[16];
+    int elem = arr + 1;
+    for (int i = 0; i < n_off; i++) {
+        char s[32] = {0};
+        if (json_get_string(&doc, elem, s, sizeof(s))) {
+            if (!parse_i64_strict(s, &offsets[i])) {
+                http_send_error(req->fd, 400, "invalid offset in 'offsets'");
+                return;
+            }
+        } else {
+            long long v = 0;
+            if (!json_get_int(&doc, elem, &v)) {
+                http_send_error(req->fd, 400, "invalid offset in 'offsets'");
+                return;
+            }
+            offsets[i] = (int64_t)v;
+        }
+        elem = json_skip(&doc, elem);
+    }
+
+    uint64_t resolved = 0;
+    char err[128] = {0};
+    if (!memory_resolve_pointer(base, offsets, (size_t)n_off, &resolved, err, sizeof(err))) {
+        http_send_error(req->fd, mem_err_status(err), err[0] ? err : "pointer resolution failed");
+        return;
+    }
+
+    // Optional write (data or value)
+    char data_str[1024] = {0};
+    int td = json_obj_get(&doc, root, "data");
+    int tv = json_obj_get(&doc, root, "value");
+    if (td >= 0 || tv >= 0) {
+        static uint8_t wbuf[512];
+        size_t wsize = 0;
+        if (td >= 0 && json_get_string(&doc, td, data_str, sizeof(data_str))) {
+            if (!parse_hex_strict(data_str, wbuf, sizeof(wbuf), &wsize)) {
+                http_send_error(req->fd, 400, "invalid hex 'data'");
+                return;
+            }
+        } else if (tv >= 0) {
+            long long v = 0;
+            if (json_get_int(&doc, tv, &v)) {
+                char type_str[16] = {0};
+                int tt = json_obj_get(&doc, root, "type");
+                if (tt >= 0) json_get_string(&doc, tt, type_str, sizeof(type_str));
+                wsize = encode_typed_value(v, type_str, wbuf);
+            }
+        }
+        if (wsize == 0) {
+            http_send_error(req->fd, 400, "invalid write payload");
+            return;
+        }
+        if (!memory_write(resolved, MemoryBase_Absolute, wbuf, wsize, NULL, err, sizeof(err))) {
+            http_send_error(req->fd, mem_err_status(err), err[0] ? err : "pointer write failed");
+            return;
+        }
+        http_send_json(req->fd, 200,
+            "{\"ok\":true,\"resolvedAddress\":\"0x%llX\",\"written\":%zu}",
+            (unsigned long long)resolved, wsize);
+        return;
+    }
+
+    // Optional read (size)
+    int ts = json_obj_get(&doc, root, "size");
+    if (ts >= 0) {
+        long long s = 0;
+        if (!json_get_int(&doc, ts, &s) || s <= 0) {
+            http_send_error(req->fd, 400, "invalid 'size'");
+            return;
+        }
+        size_t rsize = (size_t)s > 4096 ? 4096 : (size_t)s;
+        static uint8_t rbuf[4096];
+        if (!memory_read(resolved, MemoryBase_Absolute, rbuf, rsize, NULL, err, sizeof(err))) {
+            http_send_error(req->fd, mem_err_status(err), err[0] ? err : "pointer read failed");
+            return;
+        }
+        static char hex_buf[8193];
+        static const char hx[] = "0123456789abcdef";
+        for (size_t i = 0; i < rsize; i++) {
+            hex_buf[i * 2]     = hx[rbuf[i] >> 4];
+            hex_buf[i * 2 + 1] = hx[rbuf[i] & 0xF];
+        }
+        hex_buf[rsize * 2] = '\0';
+        uint32_t val32 = 0;
+        uint64_t val64 = 0;
+        if (rsize >= 4) memcpy(&val32, rbuf, 4);
+        if (rsize >= 8) memcpy(&val64, rbuf, 8);
+        static char resp[8448];
+        int n = snprintf(resp, sizeof(resp),
+            "{\"ok\":true,\"resolvedAddress\":\"0x%llX\",\"size\":%zu,\"hex\":\"%s\",\"u32\":%u,\"u64\":\"0x%llX\"}",
+            (unsigned long long)resolved, rsize, hex_buf, val32, (unsigned long long)val64);
+        if (n > 0 && (size_t)n < sizeof(resp))
+            http_send_response(req->fd, 200, "application/json", resp, (size_t)n);
+        else
+            http_send_error(req->fd, 500, "response too large");
+        return;
+    }
+
+    http_send_json(req->fd, 200, "{\"ok\":true,\"resolvedAddress\":\"0x%llX\"}",
+                   (unsigned long long)resolved);
+}
+
+static void handle_memory_search(HttpRequest *req) {
+    static JsonDoc doc;
+    int root = read_json_body(req, &doc);
+    if (root < 0) return;
+
+    char base_str[32] = "heap";
+    int t = json_obj_get(&doc, root, "base");
+    if (t >= 0) json_get_string(&doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    uint8_t needle[64];
+    size_t needle_len = 0;
+    char data_str[140] = {0};
+    t = json_obj_get(&doc, root, "data");
+    if (t >= 0 && json_get_string(&doc, t, data_str, sizeof(data_str))) {
+        if (!parse_hex_strict(data_str, needle, sizeof(needle), &needle_len)) {
+            http_send_error(req->fd, 400, "invalid hex 'data' (1..64 bytes)");
+            return;
+        }
+    } else {
+        t = json_obj_get(&doc, root, "value");
+        if (t >= 0) {
+            long long v = 0;
+            if (json_get_int(&doc, t, &v)) {
+                char type_str[16] = {0};
+                int tt = json_obj_get(&doc, root, "type");
+                if (tt >= 0) json_get_string(&doc, tt, type_str, sizeof(type_str));
+                needle_len = encode_typed_value(v, type_str, needle);
+            }
+        }
+    }
+    if (needle_len == 0) {
+        http_send_error(req->fd, 400, "missing 'data' (hex) or 'value'");
+        return;
+    }
+
+    size_t max_results = 16;
+    t = json_obj_get(&doc, root, "maxResults");
+    if (t < 0) t = json_obj_get(&doc, root, "max_results");
+    if (t >= 0) {
+        long long mr = 0;
+        if (json_get_int(&doc, t, &mr) && mr > 0) max_results = (size_t)mr;
+    }
+    if (max_results > 64) max_results = 64;
+
+    uint64_t addrs[64];
+    size_t count = 0;
+    char err[128] = {0};
+    if (!memory_search(base, needle, needle_len, addrs, max_results, &count, err, sizeof(err))) {
+        http_send_error(req->fd, mem_err_status(err), err[0] ? err : "memory search failed");
+        return;
+    }
+
+    char resp[2048];
+    size_t pos = 0;
+    int w = snprintf(resp, sizeof(resp), "{\"ok\":true,\"count\":%zu,\"matches\":[", count);
+    if (w > 0 && (size_t)w < sizeof(resp)) pos = (size_t)w;
+    for (size_t i = 0; i < count && pos + 24 < sizeof(resp); i++) {
+        w = snprintf(resp + pos, sizeof(resp) - pos, "%s\"0x%llX\"",
+                     i ? "," : "", (unsigned long long)addrs[i]);
+        if (w > 0 && (size_t)w < sizeof(resp) - pos) pos += (size_t)w;
+    }
+    if (pos + 3 < sizeof(resp)) {
+        memcpy(resp + pos, "]}", 2);
+        pos += 2;
+    }
+    http_send_response(req->fd, 200, "application/json", resp, pos);
 }
 
 // --- /diagnostics/* -----------------------------------------------------------
@@ -965,7 +1224,7 @@ static void handle_diagnostics_crash(HttpRequest *req) {
     u64 tid = tid_str[0] ? strtoull(tid_str, NULL, 16) : 0;
     bool clear = (strcmp(clear_str, "true") == 0 || strcmp(clear_str, "1") == 0);
 
-    static char log_buf[4096];
+    static char log_buf[12288];
     char filename[128] = {0};
     bool found = false;
     char err[128] = {0};
@@ -989,8 +1248,17 @@ static void handle_diagnostics_crash(HttpRequest *req) {
         return;
     }
     json_escape(log_buf, llen, escaped, esc_len + 1);
-    http_send_json(req->fd, 200, "{\"found\":true,\"filename\":\"%s\",\"content\":\"%s\"}",
-                   filename, escaped);
+    char prefix[256];
+    int plen = snprintf(prefix, sizeof(prefix), "{\"found\":true,\"filename\":\"%s\",\"content\":\"", filename);
+    const char *suffix = "\"}";
+    if (plen > 0 && (size_t)plen < sizeof(prefix)) {
+        http_send_header(req->fd, 200, "application/json", (size_t)plen + esc_len + 2);
+        http_write_all(req->fd, prefix, (size_t)plen);
+        http_write_all(req->fd, escaped, esc_len);
+        http_write_all(req->fd, suffix, 2);
+    } else {
+        http_send_error(req->fd, 500, "filename too long");
+    }
     free(escaped);
 }
 
@@ -1040,6 +1308,8 @@ static const Route kRoutes[] = {
     { "POST",   "/memory/read",       handle_memory_peek },
     { "POST",   "/memory/poke",       handle_memory_poke },
     { "POST",   "/memory/write",      handle_memory_poke },
+    { "POST",   "/memory/pointer",    handle_memory_pointer },
+    { "POST",   "/memory/search",     handle_memory_search },
     { "GET",    "/diagnostics/crash", handle_diagnostics_crash },
     { "GET",    "/network/dns",       handle_dns_get },
     { "POST",   "/network/dns",       handle_dns_set },

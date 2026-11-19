@@ -365,13 +365,21 @@ tools = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "controller_handshake",
+        "description": "Press L+R simultaneously for 300ms to pair the virtual Pro Controller as Player 1 on controller-connect prompts.",
+        "inputSchema": {"type": "object", "properties": {
+            "screenshot": {"type": "boolean", "description": "If true, also return a screenshot after the handshake."},
+            "delayMs": {"type": "integer", "description": "Milliseconds to wait before capturing the screenshot (default 300)."}
+        }},
+    },
+    {
         "name": "get_telemetry",
-        "description": "Read comprehensive hardware and runtime telemetry: CPU/GPU/EMC clocks (Hz), SoC/PCB/battery temperatures (C), battery percent and voltage, running process, and active game frame/swap counts.",
+        "description": "Read hardware and runtime telemetry: CPU/GPU/EMC clocks (Hz), SoC/PCB/battery temperatures (C), fan speed (%), battery percent/voltage, SD card free/total bytes, and active foreground process.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
         "name": "get_last_crash_report",
-        "description": "Read the latest Atmosphere creport crash log from /atmosphere/crash_reports/ (up to 4KB). Optional title_id filter and clear flag.",
+        "description": "Read the latest Atmosphere creport crash log from /atmosphere/crash_reports/ (up to 12KB, sorted by mtime). Optional title_id filter and clear flag.",
         "inputSchema": {"type": "object", "properties": {
             "title_id": {"type": "string", "description": "Optional 16-hex Title ID filter."},
             "clear": {"type": "boolean", "description": "If true, delete the crash report file after reading."}
@@ -379,7 +387,7 @@ tools = [
     },
     {
         "name": "get_memory_layout",
-        "description": "Read the active game/application process memory map: PID, Title ID, Build ID, Main NSO base address & size, Heap base & size, and Alias region base & size.",
+        "description": "Read the active game/application process memory map: PID, Title ID, Build ID, module count, RTLD base, Main NSO base & size, Heap base & size, and Alias region base & size.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
@@ -401,13 +409,45 @@ tools = [
     },
     {
         "name": "poke_memory",
-        "description": "Directly write bytes to the active application's virtual RAM. Supports hex data string or 32-bit integer value, with optional 'main' or 'heap' base offset.",
+        "description": "Directly write bytes to the active application's virtual RAM. Supports hex data string or typed integer value (u8/u16/u32/u64), with optional 'main', 'heap', or 'alias' base offset.",
         "inputSchema": {"type": "object", "properties": {
             "address": {"type": "string", "description": "Address or offset to write to (hex or decimal)."},
-            "data": {"type": "string", "description": "Hex-encoded byte string to write (e.g. 'DEADBEEF')."},
-            "value": {"type": "integer", "description": "Optional 32-bit integer value to write (if 'data' omitted)."},
+            "data": {"type": "string", "description": "Even-length hex byte string to write (e.g. 'DEADBEEF')."},
+            "value": {"type": "integer", "description": "Optional integer value to write (if 'data' omitted)."},
+            "type": {"type": "string", "enum": ["u8", "u16", "u32", "u64"], "description": "Integer width for 'value'. Default: 'u32'."},
             "base": {"type": "string", "enum": ["absolute", "main", "heap", "alias"], "description": "Base address reference. Default: 'absolute'."}
         }, "required": ["address"]},
+    },
+    {
+        "name": "pointer_peek",
+        "description": "Resolve a multi-level pointer chain ([base + off0] -> + off1 -> ...) in the active application and read bytes at the resolved address.",
+        "inputSchema": {"type": "object", "properties": {
+            "base": {"type": "string", "enum": ["main", "heap", "alias", "absolute"], "description": "Starting base region. Default: 'main'."},
+            "offsets": {"type": "array", "items": {"type": "string"}, "description": "Ordered list of hex or decimal offsets (1..16 elements, e.g. ['0x123400', '0x18', '0x40'])."},
+            "size": {"type": "integer", "description": "Number of bytes to read at the resolved address (1..1024, default 4)."}
+        }, "required": ["offsets"]},
+    },
+    {
+        "name": "pointer_poke",
+        "description": "Resolve a multi-level pointer chain ([base + off0] -> + off1 -> ...) in the active application and write hex bytes or a typed integer at the resolved address.",
+        "inputSchema": {"type": "object", "properties": {
+            "base": {"type": "string", "enum": ["main", "heap", "alias", "absolute"], "description": "Starting base region. Default: 'main'."},
+            "offsets": {"type": "array", "items": {"type": "string"}, "description": "Ordered list of hex or decimal offsets (1..16 elements)."},
+            "data": {"type": "string", "description": "Even-length hex byte string to write."},
+            "value": {"type": "integer", "description": "Optional integer value to write (if 'data' omitted)."},
+            "type": {"type": "string", "enum": ["u8", "u16", "u32", "u64"], "description": "Integer width for 'value'. Default: 'u32'."}
+        }, "required": ["offsets"]},
+    },
+    {
+        "name": "search_memory",
+        "description": "Scan readable pages of the active application's 'heap', 'main', or 'alias' region for a hex byte pattern or typed integer value (up to 64 matches).",
+        "inputSchema": {"type": "object", "properties": {
+            "base": {"type": "string", "enum": ["heap", "main", "alias"], "description": "Region to scan. Default: 'heap'."},
+            "data": {"type": "string", "description": "Even-length hex byte pattern to find (1..64 bytes)."},
+            "value": {"type": "integer", "description": "Optional integer value to search for (if 'data' omitted)."},
+            "type": {"type": "string", "enum": ["u8", "u16", "u32", "u64"], "description": "Integer width for 'value'. Default: 'u32'."},
+            "maxResults": {"type": "integer", "description": "Maximum matches to return (1..64, default 16)."}
+        }},
     },
 ]
 

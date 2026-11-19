@@ -8,13 +8,13 @@ the Switch while testing homebrew applications and commercial titles.
 
 ## What's New in sys-autopilot-plus
 
-- 🧠 **Direct Process Memory Access (`/memory/*`, tools `get_memory_layout`, `query_memory`, `peek_memory`, `poke_memory`)**: Real-time virtual RAM inspection and modification for active games and homebrew applications (sys-botbase feature parity with modern REST and native MCP). Safely reads and writes memory via Horizon OS kernel syscalls (`svcReadDebugProcessMemory`, `svcWriteDebugProcessMemory`, `svcQueryDebugProcessMemory`) and `ldr:dmnt` with lazy attach/detach and zero handle leakage. Supports relative offsets (`main` NSO, `heap`, `alias`) and absolute addresses.
-- 🎥 **Live MJPEG Video Stream (`GET /stream`)**: Real-time video streaming directly to any browser, media player, or vision pipeline via `multipart/x-mixed-replace` with configurable FPS.
-- 📊 **Hardware & System Telemetry (`GET /telemetry`, tool `get_telemetry`)**: Live CPU, GPU, and EMC clock frequencies, SoC and PCB temperatures, battery metrics, active foreground Process ID / Title ID, and frame swap counters.
-- 🎮 **Self-Healing Virtual Controller**: Transparent recovery from Horizon OS HDLS device handle invalidation (`0x1c24ca`) when launching or switching titles. Input delivery remains 100% reliable across application boundaries.
-- 🚀 **Process Lifecycle Management (`/process/*`, tools `launch_title`, `launch_nro`, `terminate_process`)**: Remotely launch installed titles, execute homebrew NROs, or terminate running games.
-- 🩺 **Crash Diagnostics (`GET /diagnostics/crash`, tool `get_crash_report`)**: Automatically read, parse, and analyze the latest Atmosphère crash reports from `sdmc:/atmosphere/crash_reports/`.
-- 🛡️ **Atmosphère 1.11+ & Horizon OS 22.x+ Stability**: Fixed upstream boot crashes (`OutOfSessions` 2021-0003) and memory exhaustion (`ResultLimitReached` 2001-0132) through lazy service initialization and trimmed heap allocation.
+- 🧠 **Direct Process Memory Access (`/memory/*`, tools `get_memory_layout`, `query_memory`, `peek_memory`, `poke_memory`, `pointer_peek`, `pointer_poke`, `search_memory`)**: Real-time virtual RAM inspection, pointer-chain resolution, pattern/value search, and modification for active games and homebrew applications (sys-botbase feature parity with modern REST and native MCP). Safely reads and writes memory via Horizon OS kernel syscalls (`svcReadDebugProcessMemory`, `svcWriteDebugProcessMemory`, `svcQueryDebugProcessMemory`) and `ldr:dmnt` with single-attach lazy lifecycle and zero handle leakage. Supports relative offsets (`main` NSO, `heap`, `alias`) and absolute addresses.
+- 🎥 **Live MJPEG Video Stream (`GET /stream`)**: Real-time video streaming directly to any browser, media player, or vision pipeline via `multipart/x-mixed-replace` with configurable FPS (default 10 FPS, range 1–30).
+- 📊 **Hardware & System Telemetry (`GET /telemetry`, tool `get_telemetry`)**: Live CPU, GPU, and EMC clock frequencies, SoC/PCB/battery temperatures (FW 10.0.0–22.5.0+ session API), cooling fan speed (%), battery metrics, SD card free/total bytes, and active foreground Process ID / Title ID.
+- 🎮 **Self-Healing Virtual Controller**: Transparent recovery from Horizon OS HDLS device handle invalidation (`0x1c24ca`) when launching or switching titles, plus native `controller_handshake` (L+R pairing) in both REST and MCP.
+- 🚀 **Process Lifecycle Management (`/process/*`, tools `get_running_process`, `launch_title`, `launch_nro`, `terminate_process`)**: Remotely launch installed titles, execute homebrew NROs, or terminate running games.
+- 🩺 **Crash Diagnostics (`GET /diagnostics/crash`, tool `get_last_crash_report`)**: Automatically read, parse, and analyze the latest Atmosphère crash reports (up to 12 KB, sorted by modification time) from `sdmc:/atmosphere/crash_reports/`.
+- 🛡️ **Atmosphère 1.11+ & Horizon OS 22.x+ Stability**: Fixed upstream boot crashes (`OutOfSessions` 2021-0003), memory exhaustion (`ResultLimitReached` 2001-0132), Core 3 busy-loop freezes, and sleep/wake race conditions.
 
 Typical agent loop:
 
@@ -203,27 +203,37 @@ Details:
 | `set_stick` | Analog stick (`side`, `x`/`y` in -1..1, optional `durationMs`) |
 | `touch_screen` | Tap or swipe touchscreen in 1280x720 (`x`, `y`, optional `x2`/`y2`, `durationMs`) |
 | `clear_input` | Release everything, recenter sticks |
+| `controller_handshake` | Press L+R for 300ms to pair the virtual Pro Controller as Player 1 |
 | `status` | Server version, firmware, controller state, uptime, battery % / charging |
 | `list_directory` | JSON listing of an SD card directory |
 | `read_file` | Read text files (32 KB pages, negative `offset` = tail) — ideal for logs |
 | `upload_file` | Write a file (base64 `content`, **streamed to SD — no size cap**) |
 | `delete_file` | Delete a file / empty directory |
 | `hash_file` | SHA-256 a file (streamed, any size); optional `expected` returns `matched` — verify an upload in one call |
+| `create_token` / `revoke_token` | Issue or revoke Bearer API tokens |
+| `sleep` / `restart` / `power_off` | Put console to sleep, reboot into CFW, or power off |
+| `list_installed_titles` | List installed titles on SD/NAND/gamecard with pagination |
+| `get_dns` / `set_dns` | Read or configure custom DNS servers (e.g., 90DNS) |
 | `get_theme` / `set_theme` | Read / set the system UI theme (`light` or `dark`; the visible change applies after the HOME menu reloads — sleep/wake or reboot) |
 | `get_nickname` / `set_nickname` | Read / set the console's device nickname |
 | `get_brightness` / `set_brightness` | Read / set screen brightness (`0.0`–`1.0`) |
 | `get_volume` / `set_volume` | Read / set master volume (`0.0`–`1.0`) |
+| `get_auto_time` / `set_auto_time` | Read / toggle internet clock sync |
+| `get_datetime` / `set_datetime` | Read local date/time/timezone or set the system clock |
 | `airplane_mode` | Enable airplane mode (disable wireless). **One-way: cuts the server off; cannot be undone remotely** |
 | `get_running_process` | Status of foreground title: running state, PID, Title ID |
 | `launch_title` | Launch installed application or title (`title_id: "0100..."`) via `pm:shell` |
 | `launch_nro` | Launch homebrew NRO executable (`path: "/switch/app.nro"`) |
 | `terminate_process` | Gracefully terminate foreground title and wait for memory pool release |
-| `get_telemetry` | Real-time hardware telemetry: CPU/GPU/EMC clocks, SoC/battery temperatures, battery %, foreground process/title ID, display frame stats |
-| `get_last_crash_report` | Fetch and inspect the latest fatal crash report from Atmosphère |
-| `get_memory_layout` | Active process memory map: PID, Title ID, 32-byte Build ID, Main NSO, Heap, and Alias bases & sizes |
+| `get_telemetry` | Real-time hardware telemetry: CPU/GPU/EMC clocks, SoC/PCB/battery temps, fan %, battery %, SD card free/total bytes, foreground process |
+| `get_last_crash_report` | Fetch and inspect the latest fatal crash report from Atmosphère (up to 12 KB) |
+| `get_memory_layout` | Active process memory map: PID, Title ID, 32-byte Build ID, module count, RTLD, Main NSO, Heap, and Alias bases & sizes |
 | `query_memory` | Query virtual memory mapping, size, and permissions (`readable`, `writable`, `executable`) at any virtual address |
-| `peek_memory` | Read raw memory bytes from active application (hex string and u32/u64 decoded, up to 1024 bytes) |
-| `poke_memory` | Write raw bytes (hex string or u8..u64 integer) to writable active application RAM |
+| `peek_memory` | Read raw memory bytes from active application (full hex string and u32/u64 decoded, up to 1024 bytes) |
+| `poke_memory` | Write raw bytes (hex string or typed `u8`/`u16`/`u32`/`u64` integer) to writable active application RAM |
+| `pointer_peek` | Resolve a multi-level pointer chain (`base` + `offsets[]`) and read bytes at the final address |
+| `pointer_poke` | Resolve a multi-level pointer chain (`base` + `offsets[]`) and write hex bytes or typed integer at the final address |
+| `search_memory` | Search `heap`, `main`, or `alias` for a hex pattern or typed integer value (up to 64 matches) |
 
 Button names: `A B X Y L R ZL ZR PLUS MINUS UP DOWN LEFT RIGHT LSTICK RSTICK
 HOME CAPTURE` (aliases: `START`, `SELECT`, `DUP/DDOWN/DLEFT/DRIGHT`).
@@ -259,7 +269,7 @@ GET /stream[?fps=1..30]
 # Fetch a single snapshot
 curl -o screen.jpg http://<switch-ip>:4150/screenshot
 
-# Stream live at 10 FPS (default: 5 FPS, range 1-30)
+# Stream live at 10 FPS (default: 10 FPS, range 1-30)
 curl http://<switch-ip>:4150/stream?fps=10
 ```
 
@@ -523,7 +533,7 @@ Remotely launch installed software, launch homebrew NROs, or terminate running t
 ```
 POST /process/launch_title    {"titleId":"0100000000010000"}
 POST /process/launch_nro      {"path":"/switch/app.nro"}
-POST /process/terminate       {"titleId":"0100000000010000"}  (or empty body for active process)
+POST /process/terminate       (terminates the active foreground process)
 ```
 
 ```sh
@@ -567,10 +577,12 @@ If no crash dump is present:
 Directly inspect and modify active application virtual RAM memory (feature parity with `sys-botbase`). Ideal for automation bots, real-time memory viewing, game state observation, and trainers:
 
 ```
-GET  /memory/layout                      Active process PID, Title ID, Build ID, Main, Heap, Alias bases
+GET  /memory/layout                      Active process PID, Title ID, Build ID, RTLD, Main, Heap, Alias bases
 GET  /memory/query?address=...[&base=...] Query region mapping, size, and permissions (R/W/X)
-POST /memory/peek                        Read raw memory bytes (hex and u32/u64 decoded)
+POST /memory/peek                        Read raw memory bytes (full hex and u32/u64 decoded, up to 4096 bytes)
 POST /memory/poke                        Write raw memory bytes (hex string or u8..u64 integer)
+POST /memory/pointer                     Resolve pointer chain (base + offsets[]) with optional read or write
+POST /memory/search                      Search heap/main/alias for hex pattern or typed integer (up to 64 matches)
 ```
 
 Supported `base` references:

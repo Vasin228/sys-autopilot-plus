@@ -65,6 +65,63 @@ static void detach_target(Handle h) {
     }
 }
 
+static bool get_main_module_info(u64 pid, uint64_t *out_rtld_base, uint64_t *out_rtld_size,
+                                 uint64_t *out_main_base, uint64_t *out_main_size,
+                                 uint32_t *out_count, char build_id[65]) {
+    if (R_FAILED(init_ldrdmnt()))
+        return false;
+    LoaderModuleInfo mods[16] = {0};
+    s32 num_mods = 0;
+    Result rc = ldrDmntGetProcessModuleInfo(pid, mods, 16, &num_mods);
+    ldrDmntExit();
+    if (R_FAILED(rc) || num_mods <= 0)
+        return false;
+
+    if (out_count) *out_count = (uint32_t)num_mods;
+    // Standard Switch apps load rtld at mods[0] and main executable at mods[1].
+    // Single-module homebrew loads directly at mods[0].
+    const LoaderModuleInfo *main_mod = (num_mods >= 2) ? &mods[1] : &mods[0];
+    if (num_mods >= 2) {
+        if (out_rtld_base) *out_rtld_base = mods[0].base_address;
+        if (out_rtld_size) *out_rtld_size = mods[0].size;
+    }
+    if (out_main_base) *out_main_base = main_mod->base_address;
+    if (out_main_size) *out_main_size = main_mod->size;
+    if (build_id) {
+        for (int i = 0; i < 32; i++) {
+            snprintf(build_id + i * 2, 3, "%02X", main_mod->build_id[i]);
+        }
+    }
+    return true;
+}
+
+static bool resolve_base_attached(Handle h, u64 pid, MemoryBase base,
+                                  uint64_t *out_base, uint64_t *out_size,
+                                  char *err, size_t err_sz) {
+    if (base == MemoryBase_Absolute) {
+        if (out_base) *out_base = 0;
+        if (out_size) *out_size = 0;
+        return true;
+    }
+    uint64_t b = 0, sz = 0;
+    if (base == MemoryBase_Main) {
+        get_main_module_info(pid, NULL, NULL, &b, &sz, NULL, NULL);
+    } else if (base == MemoryBase_Heap) {
+        svcGetInfo(&b, InfoType_HeapRegionAddress, h, 0);
+        svcGetInfo(&sz, InfoType_HeapRegionSize, h, 0);
+    } else if (base == MemoryBase_Alias) {
+        svcGetInfo(&b, InfoType_AliasRegionAddress, h, 0);
+        svcGetInfo(&sz, InfoType_AliasRegionSize, h, 0);
+    }
+    if (b == 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "requested memory base region unavailable");
+        return false;
+    }
+    if (out_base) *out_base = b;
+    if (out_size) *out_size = sz;
+    return true;
+}
+
 bool memory_get_layout(MemoryLayout *out, char *err, size_t err_sz) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
@@ -81,29 +138,16 @@ bool memory_get_layout(MemoryLayout *out, char *err, size_t err_sz) {
     out->pid = pid;
     out->title_id = tid;
 
-    // Get Heap region
     svcGetInfo(&out->heap_base, InfoType_HeapRegionAddress, h, 0);
     svcGetInfo(&out->heap_size, InfoType_HeapRegionSize, h, 0);
-
-    // Get Alias region
     svcGetInfo(&out->alias_base, InfoType_AliasRegionAddress, h, 0);
     svcGetInfo(&out->alias_size, InfoType_AliasRegionSize, h, 0);
 
     detach_target(h);
 
-    // Get main NSO module info via ldr:dmnt
-    if (R_SUCCEEDED(init_ldrdmnt())) {
-        LoaderModuleInfo mods[4] = {0};
-        s32 num_mods = 0;
-        if (R_SUCCEEDED(ldrDmntGetProcessModuleInfo(pid, mods, 4, &num_mods)) && num_mods > 0) {
-            out->main_base = mods[0].base_address;
-            out->main_size = mods[0].size;
-            for (int i = 0; i < 32; i++) {
-                snprintf(out->build_id + i * 2, 3, "%02X", mods[0].build_id[i]);
-            }
-        }
-        ldrDmntExit();
-    }
+    get_main_module_info(pid, &out->rtld_base, &out->rtld_size,
+                         &out->main_base, &out->main_size,
+                         &out->module_count, out->build_id);
     return true;
 }
 
@@ -111,26 +155,23 @@ bool memory_query(uint64_t address, MemoryBase base, MemoryRegionInfo *out, char
     if (!out) return false;
     memset(out, 0, sizeof(*out));
 
-    uint64_t target_addr = address;
-    if (base != MemoryBase_Absolute) {
-        MemoryLayout layout;
-        if (!memory_get_layout(&layout, err, err_sz))
-            return false;
-        if (base == MemoryBase_Main) target_addr = layout.main_base + address;
-        else if (base == MemoryBase_Heap) target_addr = layout.heap_base + address;
-        else if (base == MemoryBase_Alias) target_addr = layout.alias_base + address;
+    Handle h = 0;
+    u64 pid = 0;
+    Result rc = attach_target(&h, &pid, NULL);
+    if (R_FAILED(rc)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "no running application (rc=0x%x)", rc);
+        return false;
     }
 
-    Handle h = 0;
-    Result rc = attach_target(&h, NULL, NULL);
-    if (R_FAILED(rc)) {
-        if (err && err_sz > 0) snprintf(err, err_sz, "failed to attach (rc=0x%x)", rc);
+    uint64_t base_addr = 0;
+    if (!resolve_base_attached(h, pid, base, &base_addr, NULL, err, err_sz)) {
+        detach_target(h);
         return false;
     }
 
     MemoryInfo meminfo = {0};
     u32 pageinfo = 0;
-    rc = svcQueryDebugProcessMemory(&meminfo, &pageinfo, h, target_addr);
+    rc = svcQueryDebugProcessMemory(&meminfo, &pageinfo, h, base_addr + address);
     detach_target(h);
 
     if (R_FAILED(rc)) {
@@ -154,28 +195,22 @@ bool memory_read(uint64_t address, MemoryBase base, uint8_t *buf, size_t size, u
         return false;
     }
 
-    uint64_t target_addr = address;
-    if (base != MemoryBase_Absolute) {
-        MemoryLayout layout;
-        if (!memory_get_layout(&layout, err, err_sz))
-            return false;
-        if (base == MemoryBase_Main) {
-            target_addr = layout.main_base + address;
-        } else if (base == MemoryBase_Heap) {
-            target_addr = layout.heap_base + address;
-        } else if (base == MemoryBase_Alias) {
-            target_addr = layout.alias_base + address;
-        }
-    }
-
-    if (out_real_addr) *out_real_addr = target_addr;
-
     Handle h = 0;
-    Result rc = attach_target(&h, NULL, NULL);
+    u64 pid = 0;
+    Result rc = attach_target(&h, &pid, NULL);
     if (R_FAILED(rc)) {
-        if (err && err_sz > 0) snprintf(err, err_sz, "failed to attach to target process (rc=0x%x)", rc);
+        if (err && err_sz > 0) snprintf(err, err_sz, "no running application (rc=0x%x)", rc);
         return false;
     }
+
+    uint64_t base_addr = 0;
+    if (!resolve_base_attached(h, pid, base, &base_addr, NULL, err, err_sz)) {
+        detach_target(h);
+        return false;
+    }
+
+    uint64_t target_addr = base_addr + address;
+    if (out_real_addr) *out_real_addr = target_addr;
 
     rc = svcReadDebugProcessMemory(buf, h, target_addr, size);
     detach_target(h);
@@ -193,28 +228,22 @@ bool memory_write(uint64_t address, MemoryBase base, const uint8_t *buf, size_t 
         return false;
     }
 
-    uint64_t target_addr = address;
-    if (base != MemoryBase_Absolute) {
-        MemoryLayout layout;
-        if (!memory_get_layout(&layout, err, err_sz))
-            return false;
-        if (base == MemoryBase_Main) {
-            target_addr = layout.main_base + address;
-        } else if (base == MemoryBase_Heap) {
-            target_addr = layout.heap_base + address;
-        } else if (base == MemoryBase_Alias) {
-            target_addr = layout.alias_base + address;
-        }
-    }
-
-    if (out_real_addr) *out_real_addr = target_addr;
-
     Handle h = 0;
-    Result rc = attach_target(&h, NULL, NULL);
+    u64 pid = 0;
+    Result rc = attach_target(&h, &pid, NULL);
     if (R_FAILED(rc)) {
-        if (err && err_sz > 0) snprintf(err, err_sz, "failed to attach to target process (rc=0x%x)", rc);
+        if (err && err_sz > 0) snprintf(err, err_sz, "no running application (rc=0x%x)", rc);
         return false;
     }
+
+    uint64_t base_addr = 0;
+    if (!resolve_base_attached(h, pid, base, &base_addr, NULL, err, err_sz)) {
+        detach_target(h);
+        return false;
+    }
+
+    uint64_t target_addr = base_addr + address;
+    if (out_real_addr) *out_real_addr = target_addr;
 
     rc = svcWriteDebugProcessMemory(h, buf, target_addr, size);
     detach_target(h);
@@ -223,6 +252,137 @@ bool memory_write(uint64_t address, MemoryBase base, const uint8_t *buf, size_t 
         if (err && err_sz > 0) snprintf(err, err_sz, "svcWriteDebugProcessMemory failed (rc=0x%x)", rc);
         return false;
     }
+    return true;
+}
+
+bool memory_resolve_pointer(MemoryBase base, const int64_t *offsets, size_t count, uint64_t *out_addr, char *err, size_t err_sz) {
+    if (!offsets || count == 0 || count > 16 || !out_addr) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "invalid pointer chain (1..16 offsets)");
+        return false;
+    }
+
+    Handle h = 0;
+    u64 pid = 0;
+    Result rc = attach_target(&h, &pid, NULL);
+    if (R_FAILED(rc)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "no running application (rc=0x%x)", rc);
+        return false;
+    }
+
+    uint64_t base_addr = 0;
+    if (!resolve_base_attached(h, pid, base, &base_addr, NULL, err, err_sz)) {
+        detach_target(h);
+        return false;
+    }
+
+    uint64_t addr = (uint64_t)((int64_t)base_addr + offsets[0]);
+    for (size_t i = 1; i < count; i++) {
+        uint64_t ptr = 0;
+        rc = svcReadDebugProcessMemory(&ptr, h, addr, sizeof(ptr));
+        if (R_FAILED(rc)) {
+            detach_target(h);
+            if (err && err_sz > 0)
+                snprintf(err, err_sz, "pointer read failed at hop %zu (0x%llx, rc=0x%x)",
+                         i - 1, (unsigned long long)addr, rc);
+            return false;
+        }
+        if (ptr == 0) {
+            detach_target(h);
+            if (err && err_sz > 0)
+                snprintf(err, err_sz, "null pointer at hop %zu (0x%llx)",
+                         i - 1, (unsigned long long)addr);
+            return false;
+        }
+        addr = (uint64_t)((int64_t)ptr + offsets[i]);
+    }
+
+    detach_target(h);
+    *out_addr = addr;
+    return true;
+}
+
+bool memory_search(MemoryBase base, const uint8_t *needle, size_t needle_len,
+                   uint64_t *out_addrs, size_t max_results, size_t *out_count,
+                   char *err, size_t err_sz) {
+    if (!needle || needle_len == 0 || needle_len > 64 || !out_addrs || max_results == 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "invalid search parameters (pattern 1..64 bytes)");
+        return false;
+    }
+    if (base == MemoryBase_Absolute)
+        base = MemoryBase_Heap;
+    if (out_count) *out_count = 0;
+
+    Handle h = 0;
+    u64 pid = 0;
+    Result rc = attach_target(&h, &pid, NULL);
+    if (R_FAILED(rc)) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "no running application (rc=0x%x)", rc);
+        return false;
+    }
+
+    uint64_t region_start = 0, region_size = 0;
+    if (!resolve_base_attached(h, pid, base, &region_start, &region_size, err, err_sz)) {
+        detach_target(h);
+        return false;
+    }
+
+    static uint8_t scan_buf[0x4000 + 64];
+    const uint64_t region_end = region_start + region_size;
+    const uint64_t max_scan_bytes = 64ULL * 1024 * 1024; // 64 MB cap per call
+    uint64_t total_scanned = 0;
+    uint64_t since_yield = 0;
+    size_t found = 0;
+
+    uint64_t cur = region_start;
+    while (cur < region_end && found < max_results && total_scanned < max_scan_bytes) {
+        MemoryInfo mi = {0};
+        u32 pi = 0;
+        if (R_FAILED(svcQueryDebugProcessMemory(&mi, &pi, h, cur)))
+            break;
+        uint64_t seg_end = mi.addr + mi.size;
+        if (seg_end <= cur)
+            break;
+        if (seg_end > region_end)
+            seg_end = region_end;
+
+        if ((mi.perm & Perm_R) != 0 && mi.size >= needle_len) {
+            uint64_t pos = cur;
+            size_t carry = 0;
+            while (pos < seg_end && found < max_results && total_scanned < max_scan_bytes) {
+                uint64_t rem = seg_end - pos;
+                size_t chunk = rem > 0x4000 ? 0x4000 : (size_t)rem;
+                if (R_FAILED(svcReadDebugProcessMemory(scan_buf + carry, h, pos, chunk)))
+                    break;
+                size_t avail = carry + chunk;
+                if (avail >= needle_len) {
+                    size_t limit = avail - needle_len + 1;
+                    for (size_t i = 0; i < limit && found < max_results; i++) {
+                        if (scan_buf[i] == needle[0] &&
+                            (needle_len == 1 || memcmp(scan_buf + i, needle, needle_len) == 0)) {
+                            out_addrs[found++] = (pos - carry) + i;
+                        }
+                    }
+                }
+                if (needle_len > 1 && avail >= needle_len - 1) {
+                    carry = needle_len - 1;
+                    memmove(scan_buf, scan_buf + avail - carry, carry);
+                } else {
+                    carry = 0;
+                }
+                pos += chunk;
+                total_scanned += chunk;
+                since_yield += chunk;
+                if (since_yield >= 0x40000) { // yield every 256 KB to protect Core 3
+                    since_yield = 0;
+                    svcSleepThread(1000000LL);
+                }
+            }
+        }
+        cur = seg_end;
+    }
+
+    detach_target(h);
+    if (out_count) *out_count = found;
     return true;
 }
 
@@ -249,12 +409,15 @@ bool memory_get_layout(MemoryLayout *out, char *err, size_t err_sz) {
     out->running = true;
     out->pid = 0x1234;
     out->title_id = 0x01006F8002326000ULL;
+    out->rtld_base = 0x70FFFFC000ULL;
+    out->rtld_size = 0x4000ULL;
     out->main_base = 0x7100000000ULL;
     out->main_size = 0x1000000ULL;
     out->heap_base = 0x7200000000ULL;
     out->heap_size = 0x2000000ULL;
     out->alias_base = 0x7300000000ULL;
     out->alias_size = 0x3000000ULL;
+    out->module_count = 2;
     snprintf(out->build_id, sizeof(out->build_id), "DEADBEEF0102030405060708090A0B0C0D0E0F101112131415161718191A1B1C");
     return true;
 }
@@ -308,6 +471,52 @@ bool memory_write(uint64_t address, MemoryBase base, const uint8_t *buf, size_t 
     for (size_t i = 0; i < size; i++) {
         g_mock_ram[(local_idx + i) % sizeof(g_mock_ram)] = buf[i];
     }
+    return true;
+}
+
+bool memory_resolve_pointer(MemoryBase base, const int64_t *offsets, size_t count, uint64_t *out_addr, char *err, size_t err_sz) {
+    if (!offsets || count == 0 || count > 16 || !out_addr) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "invalid pointer chain");
+        return false;
+    }
+    ensure_mock_ram();
+    uint64_t base_addr = 0;
+    if (base == MemoryBase_Main) base_addr = 0x7100000000ULL;
+    else if (base == MemoryBase_Heap) base_addr = 0x7200000000ULL;
+    else if (base == MemoryBase_Alias) base_addr = 0x7300000000ULL;
+
+    uint64_t addr = (uint64_t)((int64_t)base_addr + offsets[0]);
+    for (size_t i = 1; i < count; i++) {
+        uint64_t ptr = 0;
+        size_t idx = (size_t)(addr % sizeof(g_mock_ram));
+        for (size_t b = 0; b < 8; b++)
+            ((uint8_t *)&ptr)[b] = g_mock_ram[(idx + b) % sizeof(g_mock_ram)];
+        if (ptr == 0) {
+            if (err && err_sz > 0) snprintf(err, err_sz, "null pointer at hop %zu", i - 1);
+            return false;
+        }
+        addr = (uint64_t)((int64_t)ptr + offsets[i]);
+    }
+    *out_addr = addr;
+    return true;
+}
+
+bool memory_search(MemoryBase base, const uint8_t *needle, size_t needle_len,
+                   uint64_t *out_addrs, size_t max_results, size_t *out_count,
+                   char *err, size_t err_sz) {
+    if (!needle || needle_len == 0 || needle_len > 64 || !out_addrs || max_results == 0) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "invalid search parameters");
+        return false;
+    }
+    ensure_mock_ram();
+    uint64_t base_addr = (base == MemoryBase_Main) ? 0x7100000000ULL : 0x7200000000ULL;
+    size_t found = 0;
+    for (size_t i = 0; i + needle_len <= sizeof(g_mock_ram) && found < max_results; i++) {
+        if (memcmp(g_mock_ram + i, needle, needle_len) == 0) {
+            out_addrs[found++] = base_addr + i;
+        }
+    }
+    if (out_count) *out_count = found;
     return true;
 }
 

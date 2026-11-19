@@ -63,7 +63,7 @@ bool process_get_running(bool *out_running, u64 *out_pid, u64 *out_title_id, cha
     return true;
 }
 
-bool process_terminate(char *err, size_t err_sz) {
+static bool process_terminate_internal(bool dismiss_dialog, char *err, size_t err_sz) {
     bool running = false;
     u64 pid = 0, title_id = 0;
     if (!process_get_running(&running, &pid, &title_id, err, err_sz))
@@ -98,16 +98,18 @@ bool process_terminate(char *err, size_t err_sz) {
         }
     }
 
-    if (reaped) {
-        // Allow Horizon OS Application Manager to register termination and present
-        // the modal "Software was closed" prompt, then dismiss it cleanly with 'A'.
-        // Double-tap handles timing jitter on slow microSD cards.
-        svcSleepThread(1200000000ULL); // 1.2s
-        input_tap(BTN_A, 200);
-        svcSleepThread(600000000ULL);  // 600ms
-        input_tap(BTN_A, 200);
+    if (reaped && dismiss_dialog) {
+        // Allow Horizon OS Application Manager to present the modal "Software was closed"
+        // prompt, then dismiss it with a single 'A' tap (never double-tap to avoid
+        // accidentally launching the focused HOME title).
+        svcSleepThread(1000000000ULL); // 1.0s
+        input_tap(BTN_A, 150);
     }
     return true;
+}
+
+bool process_terminate(char *err, size_t err_sz) {
+    return process_terminate_internal(true, err, err_sz);
 }
 
 static u64 detect_override_title_id(void) {
@@ -137,7 +139,7 @@ static u64 detect_override_title_id(void) {
 }
 
 bool process_launch_title(u64 title_id, u64 *out_pid, char *err, size_t err_sz) {
-    if (!process_terminate(err, err_sz))
+    if (!process_terminate_internal(false, err, err_sz))
         return false;
 
     NcmProgramLocation loc = {
@@ -181,6 +183,7 @@ bool process_launch_nro(const char *path, const char *args, u64 host_title_id, u
         "sdmc:/switch/hbmenu_nextload.cfg",
         "sdmc:/hbmenu_nextload.cfg"
     };
+    bool wrote_cfg = false;
     for (size_t i = 0; i < sizeof(cfg_paths) / sizeof(cfg_paths[0]); i++) {
         FILE *cfg = fopen(cfg_paths[i], "wb");
         if (cfg) {
@@ -188,8 +191,13 @@ bool process_launch_nro(const char *path, const char *args, u64 host_title_id, u
                 fprintf(cfg, "%s %s\n", fspath, args);
             else
                 fprintf(cfg, "%s\n", fspath);
-            fclose(cfg);
+            if (fclose(cfg) == 0)
+                wrote_cfg = true;
         }
+    }
+    if (!wrote_cfg) {
+        if (err && err_sz > 0) snprintf(err, err_sz, "failed to write hbmenu_nextload.cfg");
+        return false;
     }
 
     u64 tid = host_title_id;

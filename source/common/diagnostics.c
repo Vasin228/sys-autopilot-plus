@@ -35,6 +35,8 @@ bool diagnostics_get_last_crash(u64 filter_title_id, bool clear,
     }
 
     char latest_name[256] = {0};
+    time_t latest_mtime = 0;
+    bool have_latest = false;
     struct dirent *ent;
 
     while ((ent = readdir(dir)) != NULL) {
@@ -60,8 +62,15 @@ bool diagnostics_get_last_crash(u64 filter_title_id, bool clear,
                 continue;
         }
 
-        // Lexicographical compare because filename starts with timestamp YYYYMMDDHHMMSS
-        if (strcmp(ent->d_name, latest_name) > 0) {
+        // Prefer newest mtime, falling back to lexicographical timestamp tiebreak.
+        char probe_path[1024];
+        snprintf(probe_path, sizeof(probe_path), "%s/%s", dir_path, ent->d_name);
+        struct stat st;
+        time_t mt = (stat(probe_path, &st) == 0) ? st.st_mtime : 0;
+        if (!have_latest || mt > latest_mtime ||
+            (mt == latest_mtime && strcmp(ent->d_name, latest_name) > 0)) {
+            have_latest = true;
+            latest_mtime = mt;
             strncpy(latest_name, ent->d_name, sizeof(latest_name) - 1);
             latest_name[sizeof(latest_name) - 1] = '\0';
         }
@@ -87,7 +96,7 @@ bool diagnostics_get_last_crash(u64 filter_title_id, bool clear,
         return false;
     }
 
-    size_t to_read = 4096;
+    size_t to_read = 12288;
     if (out_log_sz > 0 && out_log_sz - 1 < to_read)
         to_read = out_log_sz - 1;
 
@@ -103,7 +112,7 @@ bool diagnostics_get_last_crash(u64 filter_title_id, bool clear,
         remove(full_path);
         // Also remove matching .bin if present
         size_t plen = strlen(full_path);
-        if (plen > 4 && strcmp(full_path + plen - 4, ".log") == 0) {
+        if (plen > 4 && strcasecmp(full_path + plen - 4, ".log") == 0) {
             memcpy(full_path + plen - 4, ".bin", 4);
             remove(full_path);
         }

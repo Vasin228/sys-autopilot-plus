@@ -360,3 +360,15 @@ Key root causes identified:
     * `exefs.nsp`: 271,452 bytes (SHA256: `27A5E63D6B24D444D0F8E71AC1EE77D8322065CD7484551731F497E9F9CA6F35`).
     * `sys-autopilot.nro`: 526,533 bytes (SHA256: `DFB4A109E5203F4614176FB064332C74AFE0C3EEBA9B3E8A1F32F6081530BA10`).
   - Deployed binaries to live console via OTA (`PUT /files`).
+
+### 18. v1.7.0 Stability Hardening, Telemetry v2 & Sys-botbase Memory Parity
+- **Changes**:
+  - **Sleep/Wake & Core**: Added `PscPmModuleId_Nifm` and `PscPmModuleId_Hid` to PSC deps (`power.c`), acknowledged all PSC transitions including `default:`, guarded duplicate sleep/wake events (`server.c`), added sleep-abort polling in `server_io_idle`, replaced `netcheck_ticks` with tick-based 2s timer, and added `spsm` boot retries.
+  - **Networking & FS**: Fixed `.127` LAN IP rejection (`netif.c`), hardened `http.c` (`Content-Length` / `Connection: close` / bounded `snprintf`), checked `fflush`/`fclose` before atomic rename and escaped JSON paths in `files.c`, fixed `screen.c` `smInitialize()` check.
+  - **Telemetry v2 (`telemetry.c`)**: Switched to `tsOpenSession`/`tsSessionGetTemperature` on FW 10.0.0+ (fixes `-128` temps on FW 22.5.0), added fan speed % (`fanOpenController` `0x3d000001u`) and SD card free/total bytes (`statvfs`), unified `psm` session, removed hardcoded `timeshift.log` polling.
+  - **Memory Engine (`memory.c`, `routes.c`, `mcp.c`)**: Fixed `main` NSO selection (`mods[1]` vs `rtld` `mods[0]`), single debug attach per call, fixed `peek_memory` hex truncation, added `type` (`u8`..`u64`) to MCP `poke_memory`, added `POST /memory/pointer` + `POST /memory/search` and MCP `pointer_peek`, `pointer_poke`, `search_memory`, `controller_handshake`.
+  - **Process / Diagnostics / Installer**: Removed blind double-tap `A` in `process_terminate()`, raised crash report cap to 12 KB with `st_mtime` sorting, sorted NSP entries by offset and released `ncm`/`ns`/`es` after install (`install.c`), fixed empty `upload_file` in MCP, synced `README.md` and `SKILL.md`.
+- **Verification**:
+  - Host tests (`./tests/run.sh`): 100% passed (including pointer chains, memory search, typed poke, handshake, empty upload).
+  - Clean Switch build (`make clean && make -j4 && make dist`): exit 0, ELF `3,137,835` B (`exefs.nsp`: 274,795 B, SHA256 `6D1C8B7EE40707BD1960E6B0ED4989E147F8A54BD12494D5491BA5F852F27DDD`; `sys-autopilot.nro`: 534,725 B, SHA256 `B62BC52624DD6FD011F5B59DBE19D0C7EEF989B61B0C600B385E52671FAA07C9`).
+  - Packaged `sys-autopilot-plus-v1.7.0.zip` (438,215 B). Pending console wakeup for OTA deploy, live verification, and GitHub release.

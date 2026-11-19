@@ -208,7 +208,15 @@ bool http_read_request(int fd, HttpRequest *req) {
 
         const char *value;
         if (header_is(cursor, "Content-Length", &value)) {
-            req->content_length = (size_t)strtoull(value, NULL, 10);
+            if (!isdigit((unsigned char)*value))
+                return false;
+            errno = 0;
+            char *end = NULL;
+            unsigned long long cl = strtoull(value, &end, 10);
+            while (end && (*end == ' ' || *end == '\t')) end++;
+            if (errno == ERANGE || !end || *end != '\0')
+                return false;
+            req->content_length = (size_t)cl;
             req->has_content_length = true;
         } else if (header_is(cursor, "Host", &value)) {
             snprintf(req->host, sizeof(req->host), "%s", value);
@@ -218,8 +226,16 @@ bool http_read_request(int fd, HttpRequest *req) {
             if (strncasecmp(value, "100-continue", 12) == 0)
                 req->expect_100 = true;
         } else if (header_is(cursor, "Connection", &value)) {
-            if (strncasecmp(value, "close", 5) == 0)
-                req->conn_close = true;
+            const char *p = value;
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == ',') p++;
+                if (strncasecmp(p, "close", 5) == 0 &&
+                    (p[5] == '\0' || p[5] == ',' || p[5] == ' ' || p[5] == '\t')) {
+                    req->conn_close = true;
+                    break;
+                }
+                while (*p && *p != ',') p++;
+            }
         }
 
         cursor = next ? next + 2 : NULL;
@@ -291,12 +307,12 @@ ssize_t http_read_body(HttpRequest *req, void *buf, size_t len) {
 // Constant-time string comparison (length difference folds into diff).
 bool http_secure_streq(const char *a, const char *b) {
     size_t alen = strlen(a), blen = strlen(b);
-    unsigned char diff = (unsigned char)(alen ^ blen);
+    size_t diff = alen ^ blen;
     size_t max = alen > blen ? alen : blen;
     for (size_t i = 0; i < max; i++) {
         unsigned char ca = i < alen ? (unsigned char)a[i] : 0;
         unsigned char cb = i < blen ? (unsigned char)b[i] : 0;
-        diff |= (unsigned char)(ca ^ cb);
+        diff |= (size_t)(ca ^ cb);
     }
     return diff == 0;
 }
@@ -348,7 +364,8 @@ void http_send_header(int fd, int code, const char *content_type, size_t content
                      "\r\n",
                      code, status_reason(code), content_type, content_length,
                      conn_hdr());
-    http_write_all(fd, hdr, (size_t)n);
+    if (n > 0 && (size_t)n < sizeof(hdr))
+        http_write_all(fd, hdr, (size_t)n);
 }
 
 void http_send_redirect(int fd, const char *location) {
@@ -391,23 +408,29 @@ void http_send_error(int fd, int code, const char *msg) {
 void http_send_unauthorized(const HttpRequest *req, bool offer_basic, bool offer_bearer) {
     const char *body = "{\"error\":\"unauthorized\"}";
     char challenges[384];
-    int cn = 0;
+    size_t cn = 0;
     if (offer_bearer) {
-        if (req->host[0]) {
-            // Point OAuth-capable MCP clients at the protected resource
-            // metadata so they can run the browser auth flow automatically.
-            cn += snprintf(challenges + cn, sizeof(challenges) - (size_t)cn,
-                           "WWW-Authenticate: Bearer realm=\"sys-autopilot\", "
-                           "resource_metadata=\"http://%s/.well-known/oauth-protected-resource\"\r\n",
-                           req->host);
+        bool host_safe = req->host[0] != '\0' && strchr(req->host, '"') == NULL &&
+                         strchr(req->host, '\r') == NULL && strchr(req->host, '\n') == NULL;
+        int w;
+        if (host_safe) {
+            w = snprintf(challenges + cn, sizeof(challenges) - cn,
+                         "WWW-Authenticate: Bearer realm=\"sys-autopilot\", "
+                         "resource_metadata=\"http://%s/.well-known/oauth-protected-resource\"\r\n",
+                         req->host);
         } else {
-            cn += snprintf(challenges + cn, sizeof(challenges) - (size_t)cn,
-                           "WWW-Authenticate: Bearer realm=\"sys-autopilot\"\r\n");
+            w = snprintf(challenges + cn, sizeof(challenges) - cn,
+                         "WWW-Authenticate: Bearer realm=\"sys-autopilot\"\r\n");
         }
+        if (w > 0 && (size_t)w < sizeof(challenges) - cn)
+            cn += (size_t)w;
     }
-    if (offer_basic)
-        cn += snprintf(challenges + cn, sizeof(challenges) - (size_t)cn,
-                       "WWW-Authenticate: Basic realm=\"sys-autopilot\"\r\n");
+    if (offer_basic) {
+        int w = snprintf(challenges + cn, sizeof(challenges) - cn,
+                         "WWW-Authenticate: Basic realm=\"sys-autopilot\"\r\n");
+        if (w > 0 && (size_t)w < sizeof(challenges) - cn)
+            cn += (size_t)w;
+    }
     challenges[cn] = '\0';
     char hdr[768];
     int n = snprintf(hdr, sizeof(hdr),
@@ -420,6 +443,7 @@ void http_send_unauthorized(const HttpRequest *req, bool offer_basic, bool offer
                      "%s"
                      "\r\n",
                      challenges, strlen(body), conn_hdr());
-    http_write_all(req->fd, hdr, (size_t)n);
+    if (n > 0 && (size_t)n < sizeof(hdr))
+        http_write_all(req->fd, hdr, (size_t)n);
     http_write_all(req->fd, body, strlen(body));
 }

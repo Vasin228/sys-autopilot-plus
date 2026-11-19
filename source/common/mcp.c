@@ -20,6 +20,8 @@
 #include "log.h"
 #include "mcp_tools.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <strings.h>
 
 #include <stdio.h>
@@ -535,12 +537,22 @@ static void tool_upload_file(HttpRequest *req, const char *id, const JsonDoc *do
         send_tool_error(req->fd, id, "missing 'content' (base64 string)");
         return;
     }
-    if (g_upload.failed || !g_upload.f || !b64dec_finish(&g_upload.dec)) {
+    if (g_upload.failed || !b64dec_finish(&g_upload.dec)) {
         send_tool_error(req->fd, id, "invalid base64 content");
         return;
     }
-    fclose(g_upload.f);
-    g_upload.f = NULL;
+    if (g_upload.f) {
+        fclose(g_upload.f);
+        g_upload.f = NULL;
+    } else {
+        // Empty base64 string (content: "") — create empty temp file cleanly.
+        FILE *ef = fopen(MCP_UPLOAD_TMP, "wb");
+        if (!ef) {
+            send_tool_error(req->fd, id, "failed to create empty upload file");
+            return;
+        }
+        fclose(ef);
+    }
 
     files_mkdirs_for(fspath);
     remove(fspath); // rename() does not overwrite on all newlib targets
@@ -1040,7 +1052,7 @@ static void tool_get_last_crash_report(HttpRequest *req, const char *id, const J
     }
     u64 tid = tid_str[0] ? strtoull(tid_str, NULL, 16) : 0;
 
-    static char log_buf[4096];
+    static char log_buf[12288];
     char filename[128] = {0};
     bool found = false;
     char err[128] = {0};
@@ -1105,6 +1117,60 @@ static void handle_initialize(HttpRequest *req, const char *id, const JsonDoc *d
     send_rpc_value(req->fd, id, "result", val, (size_t)n);
 }
 
+static bool mcp_parse_u64(const char *s, uint64_t *out) {
+    if (!s || !s[0]) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-' || *s == '\0') return false;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno == ERANGE || end == s) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    *out = (uint64_t)v;
+    return true;
+}
+
+static bool mcp_parse_i64(const char *s, int64_t *out) {
+    if (!s || !s[0]) return false;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '\0') return false;
+    errno = 0;
+    char *end = NULL;
+    long long v = strtoll(s, &end, 0);
+    if (errno == ERANGE || end == s) return false;
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != '\0') return false;
+    *out = (int64_t)v;
+    return true;
+}
+
+static bool mcp_parse_hex(const char *hex, uint8_t *out, size_t cap, size_t *out_len) {
+    if (!hex) return false;
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+    size_t len = strlen(hex);
+    if (len == 0 || (len & 1) != 0 || len / 2 > cap) return false;
+    for (size_t i = 0; i < len; i += 2) {
+        if (!isxdigit((unsigned char)hex[i]) || !isxdigit((unsigned char)hex[i + 1]))
+            return false;
+        char b[3] = { hex[i], hex[i + 1], '\0' };
+        out[i / 2] = (uint8_t)strtoul(b, NULL, 16);
+    }
+    *out_len = len / 2;
+    return true;
+}
+
+static size_t mcp_encode_typed(long long v, const char *type_str, uint8_t *buf) {
+    if (type_str && strcasecmp(type_str, "u8") == 0) {
+        uint8_t u = (uint8_t)v; memcpy(buf, &u, 1); return 1;
+    } else if (type_str && strcasecmp(type_str, "u16") == 0) {
+        uint16_t u = (uint16_t)v; memcpy(buf, &u, 2); return 2;
+    } else if (type_str && strcasecmp(type_str, "u64") == 0) {
+        uint64_t u = (uint64_t)v; memcpy(buf, &u, 8); return 8;
+    }
+    uint32_t u = (uint32_t)v; memcpy(buf, &u, 4); return 4;
+}
+
 static void tool_get_memory_layout(HttpRequest *req, const char *id) {
     MemoryLayout layout;
     char err[128] = {0};
@@ -1112,17 +1178,21 @@ static void tool_get_memory_layout(HttpRequest *req, const char *id) {
         send_tool_error(req->fd, id, err[0] ? err : "failed to get memory layout");
         return;
     }
-    char text[512];
+    char text[640];
     snprintf(text, sizeof(text),
              "Application PID: %llu (0x%llX)\n"
              "Title ID: %016llX\n"
              "Build ID: %s\n"
+             "Modules:  %u\n"
+             "RTLD Base:     0x%llX (size %llu)\n"
              "Main NSO Base: 0x%llX (size %llu)\n"
              "Heap Base:     0x%llX (size %llu)\n"
              "Alias Base:    0x%llX (size %llu)",
              (unsigned long long)layout.pid, (unsigned long long)layout.pid,
              (unsigned long long)layout.title_id,
              layout.build_id,
+             layout.module_count,
+             (unsigned long long)layout.rtld_base, (unsigned long long)layout.rtld_size,
              (unsigned long long)layout.main_base, (unsigned long long)layout.main_size,
              (unsigned long long)layout.heap_base, (unsigned long long)layout.heap_size,
              (unsigned long long)layout.alias_base, (unsigned long long)layout.alias_size);
@@ -1141,7 +1211,11 @@ static void tool_query_memory(HttpRequest *req, const char *id, const JsonDoc *d
         long long v = 0;
         if (json_get_int(doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
     }
-    uint64_t addr = strtoull(addr_str, NULL, 0);
+    uint64_t addr = 0;
+    if (!mcp_parse_u64(addr_str, &addr)) {
+        send_tool_error(req->fd, id, "invalid 'address'");
+        return;
+    }
 
     t = json_obj_get(doc, args, "base");
     if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
@@ -1183,7 +1257,11 @@ static void tool_peek_memory(HttpRequest *req, const char *id, const JsonDoc *do
         long long v = 0;
         if (json_get_int(doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
     }
-    uint64_t addr = strtoull(addr_str, NULL, 0);
+    uint64_t addr = 0;
+    if (!mcp_parse_u64(addr_str, &addr)) {
+        send_tool_error(req->fd, id, "invalid 'address'");
+        return;
+    }
 
     size_t size = 4;
     t = json_obj_get(doc, args, "size");
@@ -1205,21 +1283,28 @@ static void tool_peek_memory(HttpRequest *req, const char *id, const JsonDoc *do
         return;
     }
 
-    char hex[257] = {0};
-    size_t hex_count = size > 128 ? 128 : size;
-    for (size_t i = 0; i < hex_count; i++) {
-        snprintf(hex + i * 2, 3, "%02X", buf[i]);
+    static char hex[2049];
+    static const char hx[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < size; i++) {
+        hex[i * 2]     = hx[buf[i] >> 4];
+        hex[i * 2 + 1] = hx[buf[i] & 0xF];
     }
+    hex[size * 2] = '\0';
 
     uint32_t val32 = 0;
+    uint64_t val64 = 0;
     if (size >= 4) memcpy(&val32, buf, 4);
+    if (size >= 8) memcpy(&val64, buf, 8);
 
-    char text[512];
+    static char text[2304];
     snprintf(text, sizeof(text),
              "Read %zu bytes at 0x%llX (real 0x%llX):\n"
              "HEX: %s\n"
-             "u32: %u (0x%08X)",
-             size, (unsigned long long)addr, (unsigned long long)real_addr, hex, val32, val32);
+             "u32: %u (0x%08X)\n"
+             "u64: %llu (0x%016llX)",
+             size, (unsigned long long)addr, (unsigned long long)real_addr, hex,
+             val32, val32,
+             (unsigned long long)val64, (unsigned long long)val64);
     send_tool_ok(req->fd, id, text);
 }
 
@@ -1235,7 +1320,11 @@ static void tool_poke_memory(HttpRequest *req, const char *id, const JsonDoc *do
         long long v = 0;
         if (json_get_int(doc, t, &v)) snprintf(addr_str, sizeof(addr_str), "%llu", (unsigned long long)v);
     }
-    uint64_t addr = strtoull(addr_str, NULL, 0);
+    uint64_t addr = 0;
+    if (!mcp_parse_u64(addr_str, &addr)) {
+        send_tool_error(req->fd, id, "invalid 'address'");
+        return;
+    }
 
     t = json_obj_get(doc, args, "base");
     if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
@@ -1246,19 +1335,19 @@ static void tool_poke_memory(HttpRequest *req, const char *id, const JsonDoc *do
 
     t = json_obj_get(doc, args, "data");
     if (t >= 0 && json_get_string(doc, t, data_str, sizeof(data_str))) {
-        size_t len = strlen(data_str);
-        for (size_t i = 0; i + 1 < len && size < sizeof(buf); i += 2) {
-            char byte_str[3] = { data_str[i], data_str[i+1], '\0' };
-            buf[size++] = (uint8_t)strtoul(byte_str, NULL, 16);
+        if (!mcp_parse_hex(data_str, buf, sizeof(buf), &size)) {
+            send_tool_error(req->fd, id, "invalid hex 'data' (must be even-length hex string)");
+            return;
         }
     } else {
         t = json_obj_get(doc, args, "value");
         if (t >= 0) {
             long long v = 0;
             if (json_get_int(doc, t, &v)) {
-                uint32_t u = (uint32_t)v;
-                memcpy(buf, &u, 4);
-                size = 4;
+                char type_str[16] = {0};
+                int tt = json_obj_get(doc, args, "type");
+                if (tt >= 0) json_get_string(doc, tt, type_str, sizeof(type_str));
+                size = mcp_encode_typed(v, type_str, buf);
             }
         }
     }
@@ -1281,6 +1370,202 @@ static void tool_poke_memory(HttpRequest *req, const char *id, const JsonDoc *do
     send_tool_ok(req->fd, id, text);
 }
 
+static bool mcp_parse_offsets(const JsonDoc *doc, int args, int64_t out[16], size_t *out_count) {
+    int arr = json_obj_get(doc, args, "offsets");
+    if (arr < 0 || doc->tok[arr].type != JSMN_ARRAY) return false;
+    int n = doc->tok[arr].size;
+    if (n <= 0 || n > 16) return false;
+    int elem = arr + 1;
+    for (int i = 0; i < n; i++) {
+        char s[32] = {0};
+        if (json_get_string(doc, elem, s, sizeof(s))) {
+            if (!mcp_parse_i64(s, &out[i])) return false;
+        } else {
+            long long v = 0;
+            if (!json_get_int(doc, elem, &v)) return false;
+            out[i] = (int64_t)v;
+        }
+        elem = json_skip(doc, elem);
+    }
+    *out_count = (size_t)n;
+    return true;
+}
+
+static void tool_pointer_peek(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char base_str[32] = "main";
+    int t = json_obj_get(doc, args, "base");
+    if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    int64_t offsets[16];
+    size_t count = 0;
+    if (!mcp_parse_offsets(doc, args, offsets, &count)) {
+        send_tool_error(req->fd, id, "missing or invalid 'offsets' array (1..16 elements)");
+        return;
+    }
+
+    size_t size = 4;
+    t = json_obj_get(doc, args, "size");
+    if (t >= 0) {
+        long long s = 0;
+        if (json_get_int(doc, t, &s) && s > 0) size = (size_t)s;
+    }
+    if (size > 1024) size = 1024;
+
+    uint64_t resolved = 0;
+    char err[128] = {0};
+    if (!memory_resolve_pointer(base, offsets, count, &resolved, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "pointer resolution failed");
+        return;
+    }
+
+    static uint8_t buf[1024];
+    if (!memory_read(resolved, MemoryBase_Absolute, buf, size, NULL, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "pointer read failed");
+        return;
+    }
+
+    static char hex[2049];
+    static const char hx[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < size; i++) {
+        hex[i * 2]     = hx[buf[i] >> 4];
+        hex[i * 2 + 1] = hx[buf[i] & 0xF];
+    }
+    hex[size * 2] = '\0';
+
+    uint32_t val32 = 0;
+    uint64_t val64 = 0;
+    if (size >= 4) memcpy(&val32, buf, 4);
+    if (size >= 8) memcpy(&val64, buf, 8);
+
+    static char text[2304];
+    snprintf(text, sizeof(text),
+             "Pointer resolved to 0x%llX (read %zu bytes):\n"
+             "HEX: %s\n"
+             "u32: %u (0x%08X)\n"
+             "u64: %llu (0x%016llX)",
+             (unsigned long long)resolved, size, hex,
+             val32, val32,
+             (unsigned long long)val64, (unsigned long long)val64);
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_pointer_poke(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char base_str[32] = "main";
+    int t = json_obj_get(doc, args, "base");
+    if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    int64_t offsets[16];
+    size_t count = 0;
+    if (!mcp_parse_offsets(doc, args, offsets, &count)) {
+        send_tool_error(req->fd, id, "missing or invalid 'offsets' array (1..16 elements)");
+        return;
+    }
+
+    static uint8_t buf[256];
+    size_t size = 0;
+    char data_str[512] = {0};
+    t = json_obj_get(doc, args, "data");
+    if (t >= 0 && json_get_string(doc, t, data_str, sizeof(data_str))) {
+        if (!mcp_parse_hex(data_str, buf, sizeof(buf), &size)) {
+            send_tool_error(req->fd, id, "invalid hex 'data'");
+            return;
+        }
+    } else {
+        t = json_obj_get(doc, args, "value");
+        if (t >= 0) {
+            long long v = 0;
+            if (json_get_int(doc, t, &v)) {
+                char type_str[16] = {0};
+                int tt = json_obj_get(doc, args, "type");
+                if (tt >= 0) json_get_string(doc, tt, type_str, sizeof(type_str));
+                size = mcp_encode_typed(v, type_str, buf);
+            }
+        }
+    }
+    if (size == 0) {
+        send_tool_error(req->fd, id, "missing 'data' (hex) or 'value'");
+        return;
+    }
+
+    uint64_t resolved = 0;
+    char err[128] = {0};
+    if (!memory_resolve_pointer(base, offsets, count, &resolved, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "pointer resolution failed");
+        return;
+    }
+    if (!memory_write(resolved, MemoryBase_Absolute, buf, size, NULL, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "pointer write failed");
+        return;
+    }
+
+    char text[256];
+    snprintf(text, sizeof(text), "Pointer resolved to 0x%llX: wrote %zu bytes",
+             (unsigned long long)resolved, size);
+    send_tool_ok(req->fd, id, text);
+}
+
+static void tool_search_memory(HttpRequest *req, const char *id, const JsonDoc *doc, int args) {
+    char base_str[32] = "heap";
+    int t = json_obj_get(doc, args, "base");
+    if (t >= 0) json_get_string(doc, t, base_str, sizeof(base_str));
+    MemoryBase base = memory_parse_base(base_str);
+
+    uint8_t needle[64];
+    size_t needle_len = 0;
+    char data_str[140] = {0};
+    t = json_obj_get(doc, args, "data");
+    if (t >= 0 && json_get_string(doc, t, data_str, sizeof(data_str))) {
+        if (!mcp_parse_hex(data_str, needle, sizeof(needle), &needle_len)) {
+            send_tool_error(req->fd, id, "invalid hex 'data' (1..64 bytes)");
+            return;
+        }
+    } else {
+        t = json_obj_get(doc, args, "value");
+        if (t >= 0) {
+            long long v = 0;
+            if (json_get_int(doc, t, &v)) {
+                char type_str[16] = {0};
+                int tt = json_obj_get(doc, args, "type");
+                if (tt >= 0) json_get_string(doc, tt, type_str, sizeof(type_str));
+                needle_len = mcp_encode_typed(v, type_str, needle);
+            }
+        }
+    }
+    if (needle_len == 0) {
+        send_tool_error(req->fd, id, "missing 'data' (hex) or 'value'");
+        return;
+    }
+
+    size_t max_results = 16;
+    t = json_obj_get(doc, args, "maxResults");
+    if (t < 0) t = json_obj_get(doc, args, "max_results");
+    if (t >= 0) {
+        long long mr = 0;
+        if (json_get_int(doc, t, &mr) && mr > 0) max_results = (size_t)mr;
+    }
+    if (max_results > 64) max_results = 64;
+
+    uint64_t addrs[64];
+    size_t count = 0;
+    char err[128] = {0};
+    if (!memory_search(base, needle, needle_len, addrs, max_results, &count, err, sizeof(err))) {
+        send_tool_error(req->fd, id, err[0] ? err : "memory search failed");
+        return;
+    }
+
+    char text[2048];
+    size_t pos = 0;
+    int w = snprintf(text, sizeof(text), "Found %zu match(es):", count);
+    if (w > 0 && (size_t)w < sizeof(text)) pos = (size_t)w;
+    for (size_t i = 0; i < count && pos + 24 < sizeof(text); i++) {
+        w = snprintf(text + pos, sizeof(text) - pos, "\n0x%llX", (unsigned long long)addrs[i]);
+        if (w > 0 && (size_t)w < sizeof(text) - pos) pos += (size_t)w;
+    }
+    send_tool_ok(req->fd, id, text);
+}
+
 static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *doc,
                               int params, bool content_streamed) {
     char name[40] = "";
@@ -1300,6 +1585,8 @@ static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *d
     else if (strcmp(name, "touch_screen") == 0)     tool_touch_screen(req, id, doc, args);
     else if (strcmp(name, "clear_input") == 0)
         send_input_result_opt_screenshot(req, id, input_clear(), "ok", doc, args);
+    else if (strcmp(name, "controller_handshake") == 0)
+        send_input_result_opt_screenshot(req, id, input_handshake(), "ok", doc, args);
     else if (strcmp(name, "status") == 0)           tool_status(req, id);
     else if (strcmp(name, "list_directory") == 0)   tool_list_directory(req, id, doc, args);
     else if (strcmp(name, "read_file") == 0)        tool_read_file(req, id, doc, args);
@@ -1350,6 +1637,9 @@ static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *d
     else if (strcmp(name, "query_memory") == 0)          tool_query_memory(req, id, doc, args);
     else if (strcmp(name, "peek_memory") == 0)           tool_peek_memory(req, id, doc, args);
     else if (strcmp(name, "poke_memory") == 0)           tool_poke_memory(req, id, doc, args);
+    else if (strcmp(name, "pointer_peek") == 0)          tool_pointer_peek(req, id, doc, args);
+    else if (strcmp(name, "pointer_poke") == 0)          tool_pointer_poke(req, id, doc, args);
+    else if (strcmp(name, "search_memory") == 0)         tool_search_memory(req, id, doc, args);
     else send_rpc_error(req->fd, id, -32602, "unknown tool");
 }
 

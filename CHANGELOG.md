@@ -1,5 +1,28 @@
 # sys-autopilot
 
+## 1.7.0
+
+### Minor Changes
+
+- **Pointer Chains & Memory Search (`POST /memory/pointer`, `POST /memory/search`, MCP `pointer_peek`, `pointer_poke`, `search_memory`)**:
+  - Multi-level pointer chain dereferencing (`[base + off0] -> + off1 -> ...`) with optional read or write in a single debug attach.
+  - Pattern and typed-value RAM search across `heap`, `main`, or `alias` (up to 64 matches, 64 MB scan cap with Core 3 cooperative yields every 256 KB).
+  - Fixed `main` NSO resolution (`mods[1]` instead of `mods[0]`/`rtld` on multi-module titles) and added `rtldBase`, `rtldSize`, and `moduleCount` to `/memory/layout`.
+  - Fixed silent hex truncation in `peek_memory` (REST up to 4096B, MCP up to 1024B) and added `type` (`u8`/`u16`/`u32`/`u64`) support to MCP `poke_memory`, plus strict address/hex validation and HTTP 409 when no foreground app is running.
+- **Telemetry v2 (`GET /telemetry`, MCP `get_telemetry`)**:
+  - Fixed SoC and PCB temperatures on Horizon OS 10.0.0–22.5.0+ using session-based `tsOpenSession`/`tsSessionGetTemperature`.
+  - Added live cooling fan speed percentage (`fan.percent`) via `fan` service and SD card capacity (`sdCard.freeBytes`, `sdCard.totalBytes`) via `statvfs`.
+  - Consolidated `psm` battery info into a single lazy session and removed hardcoded `timeshift.log` polling.
+- **Controller Handshake MCP Tool**: Exposed `controller_handshake` (L+R 300ms pairing) as a native MCP tool with optional screenshot.
+- **Expanded Crash Diagnostics**: Increased crash report read cap from 4 KB to 12 KB (streaming full JSON without 1 KB truncation) and switched latest-report selection to `st_mtime`.
+- **Stability & Security Hardening**:
+  - Sleep/wake hardening: added `PscPmModuleId_Nifm`/`Hid` dependencies, acknowledged all PSC state transitions (including `default`), guarded duplicate sleep/wake events, and added sleep-abort polling inside HTTP I/O transfers.
+  - Fixed `netif.c` loopback check that rejected valid `.127` LAN IPs.
+  - Hardened `http.c` (`Content-Length` validation, comma-separated `Connection: close`, bounded `snprintf`) and `files.c` (checked `fflush`/`fclose` before atomic rename, directory rejection, JSON path escaping, 256 KB listing cap).
+  - Fixed `process_terminate()` blind double-tap `A` and verified `hbmenu_nextload.cfg` writes.
+  - Fixed `install.c` NSP entry offset sorting, raised `cnmt_nca` buffer to 64 KB, deduplicated reinstall records, and released `ncm`/`ns`/`es` sessions immediately after install.
+  - Fixed MCP `upload_file` to support empty files (`content: ""`).
+
 ## 1.6.1
 
 ### Patch Changes

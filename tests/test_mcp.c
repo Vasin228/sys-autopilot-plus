@@ -517,7 +517,8 @@ static void test_telemetry_tools(void) {
     assert(strstr(r, "\"isError\":false"));
     assert(strstr(r, "1020000000"));
     assert(strstr(r, "768000000"));
-    assert(strstr(r, "13560"));
+    assert(strstr(r, "fan"));
+    assert(strstr(r, "sdCard"));
     printf("telemetry tools ok\n");
 }
 
@@ -620,6 +621,7 @@ static void test_memory_tools(void) {
                            "\"params\":{\"name\":\"get_memory_layout\",\"arguments\":{}}}");
     assert(strstr(r, "Application PID: 4660"));
     assert(strstr(r, "Main NSO Base: 0x7100000000"));
+    assert(strstr(r, "RTLD Base:     0x70FFFFC000"));
 
     r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"tools/call\","
                "\"params\":{\"name\":\"query_memory\",\"arguments\":{\"address\":\"0x100\",\"base\":\"main\"}}}");
@@ -630,9 +632,47 @@ static void test_memory_tools(void) {
     assert(strstr(r, "Wrote 4 bytes"));
 
     r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\","
-               "\"params\":{\"name\":\"peek_memory\",\"arguments\":{\"address\":\"0x100\",\"size\":4,\"base\":\"main\"}}}");
+               "\"params\":{\"name\":\"peek_memory\",\"arguments\":{\"address\":\"0x100\",\"size\":8,\"base\":\"main\"}}}");
     assert(strstr(r, "HEX: DEADBEEF"));
-    printf("memory tools ok\n");
+    assert(strstr(r, "u64:"));
+
+    // Typed poke (u16) + invalid hex rejection
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":74,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"poke_memory\",\"arguments\":{\"address\":\"0x120\",\"value\":4660,\"type\":\"u16\",\"base\":\"main\"}}}");
+    assert(strstr(r, "Wrote 2 bytes"));
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":75,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"poke_memory\",\"arguments\":{\"address\":\"0x120\",\"data\":\"ZZZZ\",\"base\":\"main\"}}}");
+    assert(strstr(r, "\"isError\":true"));
+
+    // Pointer chain: write 8-byte pointer 0x7200000300 at main+0x200, then pointer_poke/peek at [0x200, 0x10]
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":76,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"poke_memory\",\"arguments\":{\"address\":\"0x200\",\"data\":\"0003000072000000\",\"base\":\"main\"}}}");
+    assert(strstr(r, "Wrote 8 bytes"));
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"pointer_poke\",\"arguments\":{\"base\":\"main\",\"offsets\":[\"0x200\",\"0x10\"],\"data\":\"CAFEBABE\"}}}");
+    assert(strstr(r, "0x7200000310"));
+    assert(strstr(r, "wrote 4 bytes"));
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"pointer_peek\",\"arguments\":{\"base\":\"main\",\"offsets\":[\"0x200\",\"0x10\"],\"size\":4}}}");
+    assert(strstr(r, "HEX: CAFEBABE"));
+
+    // Search memory for CAFEBABE
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":79,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"search_memory\",\"arguments\":{\"base\":\"heap\",\"data\":\"CAFEBABE\"}}}");
+    assert(strstr(r, "Found 1 match"));
+    assert(strstr(r, "0x7200000310"));
+
+    // Controller handshake MCP tool
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"controller_handshake\",\"arguments\":{}}}");
+    assert(strstr(r, "\"isError\":false"));
+
+    // Empty file upload via MCP
+    r = do_rpc("{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\","
+               "\"params\":{\"name\":\"upload_file\",\"arguments\":{\"path\":\"/empty.txt\",\"content\":\"\"}}}");
+    assert(strstr(r, "\"isError\":false"));
+    assert(strstr(r, "wrote 0 bytes"));
+    printf("memory + v1.7 tools ok\n");
 }
 
 static Config g_cfg_for_oauth;

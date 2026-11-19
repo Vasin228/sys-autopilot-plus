@@ -10,16 +10,16 @@ typedef struct {
     uint32_t emc_hz;
     int32_t  soc_temp_c;
     int32_t  pcb_temp_c;
+    int32_t  fan_percent;
     uint32_t battery_percent;
     bool     battery_charging;
     int32_t  battery_temp_c;
     uint32_t battery_volt_mv;
+    uint64_t sd_free_bytes;
+    uint64_t sd_total_bytes;
     bool     process_running;
     uint64_t process_pid;
     uint64_t process_title_id;
-    bool     has_game_stats;
-    uint64_t game_frame_count;
-    uint64_t game_swap_count;
 } TelemetryStats;
 
 // Gathers telemetry from system services and active game logs.

@@ -8,8 +8,12 @@
 static u8 g_jpeg_buf[CAPSSC_JPEG_BUFFER_SIZE];
 
 Result screen_capture_jpeg(ViLayerStack stack, const u8 **out_buf, u64 *out_size) {
-    smInitialize();
-    Result rc = capsscInitialize();
+    Result rc = smInitialize();
+    if (R_FAILED(rc)) {
+        LOGF("screen: smInitialize failed rc=0x%x\n", rc);
+        return rc;
+    }
+    rc = capsscInitialize();
     smExit();
     if (R_FAILED(rc)) {
         LOGF("screen: capsscInitialize failed rc=0x%x\n", rc);
@@ -25,6 +29,8 @@ Result screen_capture_jpeg(ViLayerStack stack, const u8 **out_buf, u64 *out_size
         LOGF("screen: capture failed rc=0x%x\n", rc);
         return rc;
     }
+    if (size > sizeof(g_jpeg_buf))
+        size = sizeof(g_jpeg_buf);
     *out_buf = g_jpeg_buf;
     *out_size = size;
     return 0;

@@ -70,6 +70,7 @@ Or in `.mcp.json` (Claude Code, Cursor, Windsurf, Cline):
 - **MCP `set_stick`** / **`POST /input/stick`**: Analog stick manipulation (`side: "left"|"right"`, `x`/`y` in `[-1.0, 1.0]`, optional `durationMs`).
 - **MCP `touch_screen`** / **`POST /input/touch`**: Touchscreen simulation in 1280×720 coordinates. Supports single taps (`x`, `y`) and interpolated drag/swipe gestures (`x2`, `y2`, `durationMs`).
 - **MCP `clear_input`** / **`POST /input/clear`**: Release all held buttons and center sticks.
+- **MCP `controller_handshake`** / **`POST /controller/handshake`**: Press L+R for 300ms to pair the virtual Pro Controller as Player 1 on controller-connect prompts.
 - **Self-Healing Virtual Controller**: The virtual HDLS controller automatically recovers from Horizon OS handle invalidation (`0x1c24ca`) when launching or switching titles. You do not need to re-initialize input after changing apps.
 
 ### Process Lifecycle Management (`/process/*`)
@@ -79,15 +80,17 @@ Or in `.mcp.json` (Claude Code, Cursor, Windsurf, Cline):
 - **MCP `terminate_process`** / **`POST /process/terminate`**: Gracefully terminate the running game or application and wait for memory pool release.
 
 ### Direct Process Memory Access (`/memory/*`)
-Real-time virtual RAM inspection and modification via `ldr:dmnt` and kernel debug syscalls (`svcReadDebugProcessMemory`, `svcWriteDebugProcessMemory`, `svcQueryDebugProcessMemory`) with lazy attach/detach and zero handle leakage.
-- **MCP `get_memory_layout`** / **`GET /memory/layout`**: Retrieve active process PID, Title ID, 32-byte Build ID, and virtual base addresses/sizes for `main` (NSO code), `heap`, and `alias` regions. **Always call this first** before relative memory operations.
+Real-time virtual RAM inspection, pointer-chain resolution, pattern search, and modification via `ldr:dmnt` and kernel debug syscalls (`svcReadDebugProcessMemory`, `svcWriteDebugProcessMemory`, `svcQueryDebugProcessMemory`) with single-attach lazy lifecycle and zero handle leakage.
+- **MCP `get_memory_layout`** / **`GET /memory/layout`**: Retrieve active process PID, Title ID, 32-byte Build ID, module count, `rtld`, `main` (NSO executable), `heap`, and `alias` bases & sizes. **Always call this first** before relative memory operations.
 - **MCP `query_memory`** / **`GET /memory/query?address=...&base=...`**: Query page mapping, size, memory type, and real permissions (`readable`, `writable`, `executable`) at any virtual address via `svcQueryDebugProcessMemory`. **Use before `poke_memory`** to confirm write permissions.
-- **MCP `peek_memory`** / **`POST /memory/peek`**: Read bytes from process memory (up to 4096 bytes via REST, 1024 bytes via MCP). Returns hex dump, `u32`, and `u64` values. Supports relative offsets (`main`, `heap`, `alias`) and absolute addresses.
-- **MCP `poke_memory`** / **`POST /memory/poke`**: Write bytes to process memory. Accepts hex data string or typed integer values (`u8`, `u16`, `u32`, `u64`). Supports relative offsets (`main`, `heap`, `alias`) and absolute addresses.
+- **MCP `peek_memory`** / **`POST /memory/peek`**: Read bytes from process memory (up to 4096 bytes via REST, 1024 bytes via MCP). Returns full hex dump, `u32`, and `u64` values. Supports relative offsets (`main`, `heap`, `alias`) and absolute addresses.
+- **MCP `poke_memory`** / **`POST /memory/poke`**: Write bytes to process memory. Accepts even-length hex data string or typed integer values (`u8`, `u16`, `u32`, `u64`). Supports relative offsets (`main`, `heap`, `alias`) and absolute addresses.
+- **MCP `pointer_peek` / `pointer_poke`** / **`POST /memory/pointer`**: Resolve multi-level pointer chains (`[base + off0] -> + off1 -> ...`, up to 16 hops) and read or write at the resolved address.
+- **MCP `search_memory`** / **`POST /memory/search`**: Scan readable pages of `heap`, `main`, or `alias` for a hex pattern (1..64 bytes) or typed integer value (returns up to 64 matching addresses).
 
 ### Telemetry & Crash Diagnostics
-- **MCP `get_telemetry`** / **`GET /telemetry`**: Live CPU, GPU, and EMC clock speeds, SoC/PCB temperatures, battery percentage/charging state, active foreground PID / Title ID, and frame swap counters.
-- **MCP `get_last_crash_report`** / **`GET /diagnostics/crash`**: Automatically locates, parses, and summarizes the latest Atmosphère crash report from `sdmc:/atmosphere/crash_reports/`. Optional `title_id` filter and `clear: true` flag.
+- **MCP `get_telemetry`** / **`GET /telemetry`**: Live CPU, GPU, and EMC clock speeds, SoC/PCB/battery temperatures (C), cooling fan speed (%), battery percentage/charging/voltage, SD card free/total bytes, and active foreground PID / Title ID.
+- **MCP `get_last_crash_report`** / **`GET /diagnostics/crash`**: Automatically locates (by mtime) and reads the latest Atmosphère crash report (up to 12 KB) from `sdmc:/atmosphere/crash_reports/`. Optional `title_id` filter and `clear: true` flag.
 - **`GET /status`**: Basic server health, firmware version, controller status, and uptime.
 
 ### SD Card File System (`sdmc:/`)

@@ -31,6 +31,21 @@ static int g_stream_fd = -1;
 static u64 g_stream_interval_ns = 100000000ULL;
 static u64 g_stream_last_frame_tick = 0;
 static ViLayerStack g_stream_stack = ViLayerStack_Screenshot;
+static ServerIdleCb g_user_idle = NULL;
+static bool g_sleep_requested = false;
+
+static bool server_io_idle(void) {
+    if (g_user_idle && !g_user_idle())
+        return false;
+    PowerEvent pe = power_poll();
+    if (pe == PowerEvent_Sleep) {
+        g_sleep_requested = true;
+        return false; // abort in-flight HTTP I/O immediately so main loop can sleep
+    } else if (pe == PowerEvent_Wake) {
+        power_ack();
+    }
+    return true;
+}
 
 void server_start_stream(int fd, int fps, ViLayerStack stack) {
     if (g_stream_fd >= 0 && g_stream_fd != fd) {
@@ -208,13 +223,13 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
     // changes (sends fail with EHOSTUNREACH until then) instead of giving up.
     int mdns_announce_left = 0;
 
-    // Throttle for the periodic nifm IP-change check (the reliable backstop;
-    // the connectivity event can fire before the address has settled or be
-    // missed entirely). The loop spins ~every 100ms; check every ~2s.
-    int netcheck_ticks = 0;
+    // Throttle for the periodic nifm IP-change check (~2s based on system ticks).
+    u64 last_netcheck_tick = armGetSystemTick();
 
-    // Let the http I/O layer drive the idle callback during transfers too.
-    http_set_idle_callback(idle);
+    // Let the http I/O layer drive the idle callback and abort transfers on sleep.
+    g_user_idle = idle;
+    g_sleep_requested = false;
+    http_set_idle_callback(server_io_idle);
 
     for (;;) {
         // Participate in sleep/wake transitions: all sockets must be closed
@@ -222,36 +237,41 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
         // the wake notification, or bsdsockets aborts and the whole console
         // crashes on the next wake. Since this loop is the only thread doing
         // socket I/O, nothing is in flight when we acknowledge here.
-        PowerEvent pe = power_poll();
+        PowerEvent pe = g_sleep_requested ? PowerEvent_Sleep : power_poll();
+        g_sleep_requested = false;
         if (pe == PowerEvent_Sleep) {
-            // Log BEFORE suspending the sink, then block all further file I/O:
-            // no fsp-srv (or bsd) IPC may occur between this point and the wake
-            // notification, or the console hangs on wake. The log sink writes
-            // to the SD card, so it must stay silent across the whole window.
-            LOGF("server: power: sleeping, releasing sockets + HDLS\n");
-            log_set_suspended(true);
-            server_stop_stream();
-            if (listen_fd >= 0) {
-                close(listen_fd);
-                listen_fd = -1;
+            if (!suspended) {
+                // Log BEFORE suspending the sink, then block all further file I/O:
+                // no fsp-srv (or bsd) IPC may occur between this point and the wake
+                // notification, or the console hangs on wake. The log sink writes
+                // to the SD card, so it must stay silent across the whole window.
+                LOGF("server: power: sleeping, releasing sockets + HDLS\n");
+                log_set_suspended(true);
+                server_stop_stream();
+                if (listen_fd >= 0) {
+                    close(listen_fd);
+                    listen_fd = -1;
+                }
+                if (mdns_fd >= 0) {
+                    mdns_close(mdns_fd);
+                    mdns_fd = -1;
+                }
+                // Release the HDLS work buffer: holding hid transfer memory
+                // across the transition crashes the sleep sequence.
+                input_suspend();
+                suspended = true;
             }
-            if (mdns_fd >= 0) {
-                mdns_close(mdns_fd);
-                mdns_fd = -1;
-            }
-            // Release the HDLS work buffer: holding hid transfer memory
-            // across the transition crashes the sleep sequence.
-            input_suspend();
-            suspended = true;
             power_ack();
         } else if (pe == PowerEvent_Wake) {
             power_ack();
-            suspended = false;
-            // Allow network hardware and nifm to fully settle before opening sockets.
-            svcSleepThread(300000000LL); // 300ms
-            // Safe to touch the SD card again now that we are awake.
-            log_set_suspended(false);
-            LOGF("server: power: awake\n");
+            if (suspended) {
+                suspended = false;
+                // Allow network hardware and nifm to fully settle before opening sockets.
+                svcSleepThread(300000000LL); // 300ms
+                // Safe to touch the SD card again now that we are awake.
+                log_set_suspended(false);
+                LOGF("server: power: awake\n");
+            }
         }
         if (suspended) {
             if (idle && !idle())
@@ -262,16 +282,10 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
 
         // React to network connectivity changes (wifi connect/disconnect,
         // airplane mode, DHCP renewal) by polling nifm for our current IP every
-        // ~2s and acting when it changes. (We tested nifm's connectivity event
-        // on hardware; on an unsubmitted request it never fires, so polling is
-        // the actual working trigger.) The check runs only while awake, so no
-        // nifm IPC ever hits the sleep window. On an IP change we rebuild BOTH
-        // sockets: a network teardown invalidates them, and the listener can
-        // otherwise silently stop accepting (poll() doesn't always report it)
-        // while mDNS keeps working, leaving the API unreachable on a live
-        // console.
-        if (++netcheck_ticks >= 20) { // ~2s at 100ms/iteration
-            netcheck_ticks = 0;
+        // ~2s and acting when it changes.
+        u64 now_tick = armGetSystemTick();
+        if (armTicksToNs(now_tick - last_netcheck_tick) >= 2000000000ULL) {
+            last_netcheck_tick = now_tick;
             if (netif_ipv4_changed()) {
                 LOGF("server: IP changed; rebuilding sockets\n");
                 server_stop_stream();
@@ -283,7 +297,7 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
                     mdns_close(mdns_fd);
                     mdns_fd = -1;
                 }
-                    mdns_ready = false; // re-query the IP on the next iteration
+                mdns_ready = false; // re-query the IP on the next iteration
             }
         }
 
@@ -360,7 +374,8 @@ void server_run(const Config *cfg, ServerIdleCb idle) {
                         int plen = snprintf(part_hdr, sizeof(part_hdr),
                             "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %llu\r\n\r\n",
                             (unsigned long long)size);
-                        if (!http_write_all(g_stream_fd, part_hdr, plen) ||
+                        if (plen <= 0 || (size_t)plen >= sizeof(part_hdr) ||
+                            !http_write_all(g_stream_fd, part_hdr, (size_t)plen) ||
                             !http_write_all(g_stream_fd, jpeg, (size_t)size) ||
                             !http_write_all(g_stream_fd, "\r\n", 2)) {
                             server_stop_stream();

@@ -45,9 +45,9 @@ bool netif_current_ipv4(uint32_t *out_s_addr) {
     u32 addr = 0; // struct in_addr.s_addr (network byte order)
     if (R_FAILED(nifmGetCurrentIpAddress(&addr)) || addr == 0)
         return false;
-    // Reject loopback (first octet 127) regardless of host endianness.
+    // Reject loopback (127.x.x.x; addr is network byte order so o[0] is first octet).
     const uint8_t *o = (const uint8_t *)&addr;
-    if (o[0] == 127 || o[3] == 127)
+    if (o[0] == 127)
         return false;
     *out_s_addr = addr;
     return true;

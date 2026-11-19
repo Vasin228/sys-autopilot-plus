@@ -74,12 +74,17 @@ static bool resolve_query_path(HttpRequest *req, char *out, size_t outsz) {
     return true;
 }
 
-// Appends to a heap-grown buffer, doubling as needed. Returns false on OOM.
+// Appends to a heap-grown buffer, doubling as needed up to 256 KB. Returns false on OOM/cap.
+#define LISTING_MAX_BYTES (256 * 1024)
 static bool buf_append(char **buf, size_t *len, size_t *cap, const char *data, size_t n) {
+    if (*len + n + 1 > LISTING_MAX_BYTES)
+        return false;
     if (*len + n + 1 > *cap) {
         size_t newcap = *cap ? *cap : 1024;
         while (*len + n + 1 > newcap)
             newcap *= 2;
+        if (newcap > LISTING_MAX_BYTES)
+            newcap = LISTING_MAX_BYTES;
         char *nb = realloc(*buf, newcap);
         if (!nb)
             return false;
@@ -126,9 +131,13 @@ char *files_build_listing(const char *fspath, const char *userpath,
 
     char head[600];
     char escaped[520];
-    json_escape(userpath, strlen(userpath), escaped, sizeof(escaped));
+    if (json_escape(userpath, strlen(userpath), escaped, sizeof(escaped)) == (size_t)-1) {
+        closedir(dir);
+        *err = "path too long";
+        return NULL;
+    }
     int n = snprintf(head, sizeof(head), "{\"path\":\"%s\",\"entries\":[", escaped);
-    ok = buf_append(&json, &len, &cap, head, (size_t)n);
+    ok = (n > 0 && (size_t)n < sizeof(head)) && buf_append(&json, &len, &cap, head, (size_t)n);
 
     struct dirent *ent;
     bool first = true;
@@ -289,6 +298,8 @@ static void send_file(HttpRequest *req, const char *fspath, const struct stat *s
         remaining -= (long long)n;
     }
     fclose(f);
+    if (remaining > 0)
+        req->keep_alive = false;
 }
 
 void files_handle_get(HttpRequest *req) {
@@ -342,9 +353,13 @@ void files_handle_hash(HttpRequest *req) {
         http_send_error(req->fd, code, err);
         return;
     }
+    char escaped[768];
+    const char *rel = fspath + strlen(FILES_ROOT);
+    if (json_escape(rel, strlen(rel), escaped, sizeof(escaped)) == (size_t)-1)
+        snprintf(escaped, sizeof(escaped), "%s", rel);
     http_send_json(req->fd, 200,
                    "{\"path\":\"%s\",\"algorithm\":\"sha256\",\"hash\":\"%s\",\"size\":%lld}",
-                   fspath + strlen(FILES_ROOT), hexbuf, size);
+                   escaped, hexbuf, size);
 }
 
 void files_handle_put(HttpRequest *req) {
@@ -354,6 +369,19 @@ void files_handle_put(HttpRequest *req) {
 
     if (!req->has_content_length) {
         http_send_error(req->fd, 411, "Content-Length required");
+        return;
+    }
+
+    size_t fplen = strlen(fspath);
+    if (fplen == 0 || fspath[fplen - 1] == '/') {
+        req->keep_alive = false;
+        http_send_error(req->fd, 400, "path must be a file, not a directory");
+        return;
+    }
+    struct stat st;
+    if (stat(fspath, &st) == 0 && S_ISDIR(st.st_mode)) {
+        req->keep_alive = false;
+        http_send_error(req->fd, 400, "target path is a directory");
         return;
     }
 
@@ -368,6 +396,7 @@ void files_handle_put(HttpRequest *req) {
     // Stage into a temp file first so an aborted or failed upload never clobbers an existing file.
     FILE *f = fopen(tmppath, "wb");
     if (!f) {
+        req->keep_alive = false;
         http_send_error(req->fd, 500, "failed to open temp file for writing");
         return;
     }
@@ -384,14 +413,19 @@ void files_handle_put(HttpRequest *req) {
         }
         total += (size_t)n;
     }
-    fclose(f);
+    if (fflush(f) != 0 || ferror(f))
+        write_err = true;
+    if (fclose(f) != 0)
+        write_err = true;
 
     if (write_err) {
+        req->keep_alive = false;
         remove(tmppath);
         http_send_error(req->fd, 507, "write failed (sd card full?)");
         return;
     }
     if (total != req->content_length) {
+        req->keep_alive = false;
         remove(tmppath);
         http_send_error(req->fd, 400, "incomplete upload");
         return;
@@ -408,8 +442,11 @@ void files_handle_put(HttpRequest *req) {
     }
 
     LOGF("files: wrote %zu bytes to %s\n", total, fspath);
-    http_send_json(req->fd, 201, "{\"written\":%zu,\"path\":\"%s\"}", total,
-                   fspath + strlen(FILES_ROOT));
+    char escaped[768];
+    const char *rel = fspath + strlen(FILES_ROOT);
+    if (json_escape(rel, strlen(rel), escaped, sizeof(escaped)) == (size_t)-1)
+        snprintf(escaped, sizeof(escaped), "%s", rel);
+    http_send_json(req->fd, 201, "{\"written\":%zu,\"path\":\"%s\"}", total, escaped);
 }
 
 void files_handle_delete(HttpRequest *req) {
@@ -422,5 +459,9 @@ void files_handle_delete(HttpRequest *req) {
         http_send_error(req->fd, err && strstr(err, "no such") ? 404 : 500, err);
         return;
     }
-    http_send_json(req->fd, 200, "{\"deleted\":\"%s\"}", fspath + strlen(FILES_ROOT));
+    char escaped[768];
+    const char *rel = fspath + strlen(FILES_ROOT);
+    if (json_escape(rel, strlen(rel), escaped, sizeof(escaped)) == (size_t)-1)
+        snprintf(escaped, sizeof(escaped), "%s", rel);
+    http_send_json(req->fd, 200, "{\"deleted\":\"%s\"}", escaped);
 }

@@ -52,7 +52,11 @@ bool power_init(void) {
         return false;
     }
 
-    static const u32 deps[] = { PscPmModuleId_Fs };
+    static const u32 deps[] = {
+        PscPmModuleId_Fs,
+        PscPmModuleId_Nifm,
+        PscPmModuleId_Hid,
+    };
     for (int i = 0; i < 20; i++) {
         rc = pscmGetPmModule(&g_module, POWER_MODULE_ID, deps,
                              sizeof(deps) / sizeof(deps[0]), true);
@@ -95,6 +99,9 @@ PowerEvent power_poll(void) {
         case PscPmState_Awake:
             return PowerEvent_Wake;
         default:
+            // Horizon OS PSC requires every delivered state transition to be
+            // acknowledged or the power transition stalls until timeout/panic.
+            pscPmModuleAcknowledge(&g_module, g_pending_state);
             return PowerEvent_None;
     }
 }
@@ -117,13 +124,17 @@ void power_exit(void) {
 static bool g_spsm_ok;
 
 bool power_spsm_init(void) {
-    Result rc = spsmInitialize();
-    if (R_FAILED(rc)) {
-        LOGF("power: spsmInitialize failed rc=0x%x\n", rc);
-        return false;
+    Result rc = 0;
+    for (int i = 0; i < 15; i++) {
+        rc = spsmInitialize();
+        if (R_SUCCEEDED(rc)) {
+            g_spsm_ok = true;
+            return true;
+        }
+        svcSleepThread(200000000ULL);
     }
-    g_spsm_ok = true;
-    return true;
+    LOGF("power: spsmInitialize failed rc=0x%x\n", rc);
+    return false;
 }
 
 void power_spsm_exit(void) {

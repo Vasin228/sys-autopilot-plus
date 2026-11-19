@@ -442,7 +442,7 @@ static bool install_entries(InstallReadFn read_fn, void *ctx, uint64_t consumed,
     }
 
     // Buffers for the small metadata files (cnmt.nca / .tik / .cert).
-    static u8 cnmt_nca[0x4000];
+    static u8 cnmt_nca[0x10000];
     size_t cnmt_nca_size = 0;
     NcmContentId meta_cid = {0};
     bool have_meta_cid = false;
@@ -614,17 +614,27 @@ static bool install_entries(InstallReadFn read_fn, void *ctx, uint64_t consumed,
             if (pkg.type == NcmContentMetaType_Patch) base_id = pkg.id ^ 0x800;
             else if (pkg.type == NcmContentMetaType_AddOnContent) base_id = (pkg.id ^ 0x1000) & ~(u64)0xFFF;
 
-            // Merge with existing records for this base id.
+            // Merge with existing records for this base id (replace duplicate if reinstalling).
             static NsExtContentStorageRecord recs[64];
             s32 existing = 0;
             nsext_list_application_record_content_meta(0, base_id, recs, 63, &existing);
             if (existing < 0 || existing > 63) existing = 0;
-            recs[existing].key = meta_key;
-            recs[existing].storage_id = (u8)sid;
-            memset(recs[existing].padding, 0, sizeof(recs[existing].padding));
+            s32 slot = existing;
+            for (s32 r = 0; r < existing; r++) {
+                if (recs[r].key.id == meta_key.id &&
+                    recs[r].key.version == meta_key.version &&
+                    recs[r].key.type == meta_key.type) {
+                    slot = r;
+                    break;
+                }
+            }
+            recs[slot].key = meta_key;
+            recs[slot].storage_id = (u8)sid;
+            memset(recs[slot].padding, 0, sizeof(recs[slot].padding));
+            u32 total_recs = (u32)(slot == existing ? existing + 1 : existing);
 
             nsext_delete_application_record(base_id); // ignore (may not exist)
-            rc = nsext_push_application_record(base_id, recs, (u32)(existing + 1));
+            rc = nsext_push_application_record(base_id, recs, total_recs);
             if (R_FAILED(rc)) { fail(out, 500, "push application record failed (0x%x)", rc); failed = true; }
         }
     }
@@ -723,6 +733,15 @@ static bool install_nsp(InstallReadFn read_fn, void *ctx, NcmStorageId sid,
         memcpy(entries[i].name, pe[i].name, sizeof(entries[i].name));
         entries[i].abs_offset = data_start + pe[i].offset;
         entries[i].size = pe[i].size;
+    }
+    // Sort defensively by abs_offset ascending so out-of-order PFS0 tables work.
+    for (int i = 1; i < file_count; i++) {
+        InstallEntry key = entries[i];
+        int j = i - 1;
+        while (j >= 0 && entries[j].abs_offset > key.abs_offset) {
+            entries[j + 1] = entries[j]; j--;
+        }
+        entries[j + 1] = key;
     }
     // The 0x1104-byte detection prefix usually extends past the PFS0 header
     // (small NSPs have headers of a few hundred bytes); those leftover bytes
@@ -847,13 +866,17 @@ bool install_stream(InstallReadFn read_fn, void *ctx, uint64_t total_size,
 
     uint64_t xci_root = 0;
     ContainerKind kind = container_detect(prefix, prefix_len, &xci_root);
+    bool ok = false;
     if (kind == CONTAINER_NSP)
-        return install_nsp(read_fn, ctx, sid, prefix, prefix_len, consumed - prefix_len, out);
-    if (kind == CONTAINER_XCI)
-        return install_xci(read_fn, ctx, sid, xci_root, prefix, prefix_len, consumed - prefix_len, out);
+        ok = install_nsp(read_fn, ctx, sid, prefix, prefix_len, consumed - prefix_len, out);
+    else if (kind == CONTAINER_XCI)
+        ok = install_xci(read_fn, ctx, sid, xci_root, prefix, prefix_len, consumed - prefix_len, out);
+    else
+        fail(out, 400, "unrecognized container (need NSP/PFS0 or XCI)");
 
-    fail(out, 400, "unrecognized container (need NSP/PFS0 or XCI)");
-    return false;
+    // Release ncm/ns/es sessions immediately after install to avoid holding persistent handles.
+    install_exit();
+    return ok;
 }
 
 #endif // __SWITCH__
