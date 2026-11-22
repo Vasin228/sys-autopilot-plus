@@ -15,8 +15,8 @@
 
 // Inner heap: socket transfer memory + stdio buffers + dir listing JSON +
 // headroom for the title installer (ncm IPC, mounting the cnmt NCA). The large
-// fixed buffers (JPEG, I/O, HDLS workmem, install chunk) are static bss.
-#define INNER_HEAP_SIZE 0x100000
+// fixed buffers (shared scratch, HDLS workmem) are static bss.
+#define INNER_HEAP_SIZE 0x80000
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,8 +48,8 @@ static const SocketInitConfig kSocketConfig = {
     .udp_rx_buf_size     = 0xA500,
     .sb_efficiency       = 2,
     // Sessions in concurrent use: listener, accepted client, mDNS UDP socket,
-    // plus stream and extra concurrent socket headroom.
-    .num_bsd_sessions    = 8,
+    // plus stream and 1 spare concurrent socket.
+    .num_bsd_sessions    = 5,
     // Sysmodules in pool_partition 2 need bsd:s (system socket service).
     // BsdServiceType_Auto tries bsd:s first, then falls back to bsd:u.
     .bsd_service_type    = BsdServiceType_Auto,
@@ -101,15 +101,7 @@ void __appInit(void)
         svcSleepThread(500000000ULL);
     }
 
-    // 4. HID Debug (controller emulation)
-    for (int i = 0; i < 30; i++) {
-        rc = hiddbgInitialize();
-        if (R_SUCCEEDED(rc))
-            break;
-        svcSleepThread(500000000ULL);
-    }
-
-    // 7. BSD socket service: bsd:u is started later in the boot sequence.
+    // 4. BSD socket service: bsd:u is started later in the boot sequence.
     // Retry up to 60 times (30 seconds) until the network stack is up.
     for (int i = 0; i < 60; i++) {
         rc = socketInitialize(&kSocketConfig);
@@ -153,7 +145,6 @@ void __appExit(void)
     power_spsm_exit();
     power_exit();
     socketExit();
-    hiddbgExit();
     fsdevUnmountAll();
     fsExit();
 }

@@ -1,4 +1,5 @@
 #include "install.h"
+#include "scratch.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -213,7 +214,7 @@ typedef struct {
     u32 reserved2;
 } PackagedContentMetaHeader;
 
-static u8 g_chunk[INSTALL_CHUNK];
+#define g_chunk g_scratch_buf
 
 static bool g_ncm_ok, g_ns_ok, g_es_ok;
 
@@ -442,7 +443,9 @@ static bool install_entries(InstallReadFn read_fn, void *ctx, uint64_t consumed,
     }
 
     // Buffers for the small metadata files (cnmt.nca / .tik / .cert).
-    static u8 cnmt_nca[0x10000];
+    // g_scratch_buf[0..0x20000) is g_chunk; use [0x20000..0x30000) for cnmt_nca.
+    u8 *cnmt_nca = g_scratch_buf + INSTALL_CHUNK;
+    const size_t cnmt_nca_cap = 0x10000;
     size_t cnmt_nca_size = 0;
     NcmContentId meta_cid = {0};
     bool have_meta_cid = false;
@@ -477,7 +480,7 @@ static bool install_entries(InstallReadFn read_fn, void *ctx, uint64_t consumed,
 
         if (is_cnmt) {
             // Buffer the meta NCA in RAM, then write it to NCM too.
-            if (entries[i].size > sizeof(cnmt_nca)) { fail(out, 400, "cnmt nca too large"); failed = true; break; }
+            if (entries[i].size > cnmt_nca_cap) { fail(out, 400, "cnmt nca too large"); failed = true; break; }
             size_t got = 0;
             while (got < entries[i].size) {
                 n = read_fn(ctx, cnmt_nca + got, entries[i].size - got);

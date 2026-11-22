@@ -31,17 +31,37 @@ static u8 g_workmem[0x1000] __attribute__((aligned(0x1000)));
 static HiddbgHdlsSessionId g_session_id;
 static HiddbgHdlsHandle g_handle;
 static HiddbgHdlsState g_state;
+static bool g_hiddbg_ready;
 static bool g_workbuf_attached;
 static bool g_attached;
+
+static Result ensure_hiddbg(void) {
+    if (g_hiddbg_ready)
+        return 0;
+    Result rc = smInitialize();
+    if (R_FAILED(rc))
+        return rc;
+    rc = hiddbgInitialize();
+    smExit();
+    if (R_FAILED(rc)) {
+        LOGF("input: hiddbgInitialize failed rc=0x%x\n", rc);
+        return rc;
+    }
+    g_hiddbg_ready = true;
+    return 0;
+}
 
 // The HDLS work buffer is transfer memory mapped into the hid sysmodule.
 // It is attached lazily (first input request) and MUST be released across
 // sleep: holding it during a sleep transition breaks hid's own power
 // handling and crashes the console (omm aborts with psc error 2165-1001).
 static Result ensure_workbuf(void) {
+    Result rc = ensure_hiddbg();
+    if (R_FAILED(rc))
+        return rc;
     if (g_workbuf_attached)
         return 0;
-    Result rc = hiddbgAttachHdlsWorkBuffer(&g_session_id, g_workmem, sizeof(g_workmem));
+    rc = hiddbgAttachHdlsWorkBuffer(&g_session_id, g_workmem, sizeof(g_workmem));
     if (R_FAILED(rc)) {
         LOGF("input: hiddbgAttachHdlsWorkBuffer failed rc=0x%x\n", rc);
         return rc;
@@ -51,6 +71,8 @@ static Result ensure_workbuf(void) {
 }
 
 void input_suspend(void) {
+    if (!g_hiddbg_ready)
+        return;
     hiddbgUnsetTouchScreenAutoPilotState();
     if (g_attached) {
         hiddbgDetachHdlsVirtualDevice(g_handle);
@@ -66,6 +88,10 @@ void input_suspend(void) {
 
 void input_exit(void) {
     input_suspend();
+    if (g_hiddbg_ready) {
+        hiddbgExit();
+        g_hiddbg_ready = false;
+    }
 }
 
 Result input_attach(void) {
@@ -180,6 +206,8 @@ Result input_release(u64 mask) {
 }
 
 Result input_clear(void) {
+    if (!g_hiddbg_ready)
+        return 0;
     hiddbgUnsetTouchScreenAutoPilotState();
     if (!g_attached)
         return 0;
@@ -226,6 +254,10 @@ static u32 clamp_coord(int v, int max_val) {
 }
 
 Result input_touch(int x, int y, int x2, int y2, int duration_ms) {
+    Result init_rc = ensure_hiddbg();
+    if (R_FAILED(init_rc))
+        return init_rc;
+
     u32 sx = clamp_coord(x, 1280);
     u32 sy = clamp_coord(y, 720);
     bool is_swipe = (x2 >= 0 && y2 >= 0 && (x2 != x || y2 != y));

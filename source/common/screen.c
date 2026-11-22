@@ -1,11 +1,10 @@
 #include "screen.h"
 #include "log.h"
+#include "scratch.h"
 
 #include <string.h>
 
 #define CAPTURE_TIMEOUT_NS 100000000ULL // 100ms
-
-static u8 g_jpeg_buf[CAPSSC_JPEG_BUFFER_SIZE];
 
 Result screen_capture_jpeg(ViLayerStack stack, const u8 **out_buf, u64 *out_size) {
     Result rc = smInitialize();
@@ -21,7 +20,7 @@ Result screen_capture_jpeg(ViLayerStack stack, const u8 **out_buf, u64 *out_size
     }
 
     u64 size = 0;
-    rc = capsscCaptureJpegScreenShot(&size, g_jpeg_buf, sizeof(g_jpeg_buf),
+    rc = capsscCaptureJpegScreenShot(&size, g_scratch_buf, SCRATCH_BUF_SIZE,
                                      stack, CAPTURE_TIMEOUT_NS);
     capsscExit();
 
@@ -29,9 +28,9 @@ Result screen_capture_jpeg(ViLayerStack stack, const u8 **out_buf, u64 *out_size
         LOGF("screen: capture failed rc=0x%x\n", rc);
         return rc;
     }
-    if (size > sizeof(g_jpeg_buf))
-        size = sizeof(g_jpeg_buf);
-    *out_buf = g_jpeg_buf;
+    if (size > SCRATCH_BUF_SIZE)
+        size = SCRATCH_BUF_SIZE;
+    *out_buf = g_scratch_buf;
     *out_size = size;
     return 0;
 }

@@ -1,5 +1,15 @@
 # sys-autopilot
 
+## 1.7.1
+
+### Patch Changes
+
+- **System Pool RAM & Session Footprint Optimization (~940 KB saved with zero feature cuts)**:
+  - Unified mutually exclusive static buffers (`screen.c`, `files.c`, `install.c`, `memory.c`, `mcp.c`) into a single shared 512 KB `g_scratch_buf` (`scratch.c`/`scratch.h`).
+  - Reduced `INNER_HEAP_SIZE` from 1 MB (`0x100000`) to 512 KB (`0x80000`).
+  - Made `hiddbgInitialize()` lazy on first button/touch request (`input.c`) instead of holding a persistent `hid:dbg` session at boot.
+  - Tuned `num_bsd_sessions` from 8 to 5 to reduce `bsd:s` transfer memory and session pressure alongside other sysmodules.
+
 ## 1.7.0
 
 ### Minor Changes

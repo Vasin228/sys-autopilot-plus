@@ -27,7 +27,7 @@ cc $CFLAGS -o "$OUT/test_mdns" test_mdns.c \
 "$OUT/test_mdns"
 
 echo "== test_install =="
-cc $CFLAGS -o "$OUT/test_install" test_install.c "$SRC/install.c"
+cc $CFLAGS -o "$OUT/test_install" test_install.c "$SRC/install.c" "$SRC/scratch.c"
 "$OUT/test_install"
 
 echo "== test_oauth =="
@@ -49,7 +49,8 @@ cc $CFLAGS -Ifake \
     "$SRC/buttons.c" "$SRC/apiargs.c" "$SRC/files.c" "$SRC/power.c" \
     "$SRC/oauth.c" "$SRC/sha256.c" "$SRC/config.c" "$SRC/device_info.c" \
     "$SRC/settings.c" "$SRC/titles.c" "$SRC/network.c" \
-    "$SRC/process.c" "$SRC/diagnostics.c" "$SRC/telemetry.c" "$SRC/memory.c"
+    "$SRC/process.c" "$SRC/diagnostics.c" "$SRC/telemetry.c" "$SRC/memory.c" \
+    "$SRC/scratch.c"
 "$OUT/test_mcp"
 
 # Release tooling: our resilient changelog generator (replaces the flaky

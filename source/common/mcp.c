@@ -18,6 +18,7 @@
 #include "network.h"
 #include "memory.h"
 #include "log.h"
+#include "scratch.h"
 #include "mcp_tools.h"
 
 #include <ctype.h>
@@ -1645,7 +1646,8 @@ static void handle_tools_call(HttpRequest *req, const char *id, const JsonDoc *d
 
 void mcp_handle_post(HttpRequest *req) {
     static char doc_buf[MCP_DOC_MAX];
-    static char chunk[0x8000];
+    char *chunk = (char *)g_scratch_buf;
+    const size_t chunk_sz = 0x8000;
     static JsonDoc doc;
 
     if (!req->has_content_length) {
@@ -1661,7 +1663,7 @@ void mcp_handle_post(HttpRequest *req) {
 
     ssize_t n;
     int jerr = 0;
-    while ((n = http_read_body(req, chunk, sizeof(chunk))) > 0) {
+    while ((n = http_read_body(req, chunk, chunk_sz)) > 0) {
         jerr = jstream_feed(&js, chunk, (size_t)n);
         if (jerr)
             break;

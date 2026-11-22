@@ -1,6 +1,7 @@
 #include "files.h"
 #include "json.h"
 #include "log.h"
+#include "scratch.h"
 #include "sha256.h"
 
 #include <stdio.h>
@@ -12,8 +13,7 @@
 #include <sys/stat.h>
 
 #define IO_BUF_SIZE 0x8000 // 32 KB
-
-static char g_io_buf[IO_BUF_SIZE];
+#define g_io_buf ((char *)g_scratch_buf)
 
 bool files_resolve(const char *userpath, char *out, size_t outsz, const char **err) {
     if (userpath == NULL || userpath[0] == '\0') {

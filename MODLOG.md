@@ -372,3 +372,13 @@ Key root causes identified:
   - Host tests (`./tests/run.sh`): 100% passed (including pointer chains, memory search, typed poke, handshake, empty upload).
   - Clean Switch build (`make clean && make -j4 && make dist`): exit 0, ELF `3,137,835` B (`exefs.nsp`: 274,795 B, SHA256 `6D1C8B7EE40707BD1960E6B0ED4989E147F8A54BD12494D5491BA5F852F27DDD`; `sys-autopilot.nro`: 534,725 B, SHA256 `B62BC52624DD6FD011F5B59DBE19D0C7EEF989B61B0C600B385E52671FAA07C9`).
   - Packaged `sys-autopilot-plus-v1.7.0.zip` (438,215 B). Pending console wakeup for OTA deploy, live verification, and GitHub release.
+
+### 19. v1.7.1 System Pool RAM & Session Footprint Optimization
+- **Changes**:
+  - Unified mutually exclusive static buffers (`screen.c` JPEG, `files.c` I/O, `install.c` chunk + cnmt_nca, `memory.c` search scan_buf, `mcp.c` request chunk) into a single shared 512 KB `g_scratch_buf` (`source/common/scratch.h` / `scratch.c`).
+  - Reduced `INNER_HEAP_SIZE` from `0x100000` (1 MB) to `0x80000` (512 KB) in `source/main.c`.
+  - Made `hiddbgInitialize()` lazy (`ensure_hiddbg()` in `source/common/input.c`) instead of holding `hid:dbg` open from boot (`source/main.c`).
+  - Reduced `kSocketConfig.num_bsd_sessions` from 8 to 5 (`source/main.c`).
+- **Verification**:
+  - Host tests (`./tests/run.sh`): 100% passed.
+  - Clean Switch build (`make clean && make -j4 && make dist`): exit 0; ELF footprint dropped from `3,137,835` B to `2,335,235` B (-802,600 B static RAM).

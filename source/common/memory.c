@@ -1,5 +1,6 @@
 #include "memory.h"
 #include "log.h"
+#include "scratch.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -326,7 +327,7 @@ bool memory_search(MemoryBase base, const uint8_t *needle, size_t needle_len,
         return false;
     }
 
-    static uint8_t scan_buf[0x4000 + 64];
+    uint8_t *scan_buf = g_scratch_buf;
     const uint64_t region_end = region_start + region_size;
     const uint64_t max_scan_bytes = 64ULL * 1024 * 1024; // 64 MB cap per call
     uint64_t total_scanned = 0;
